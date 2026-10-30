@@ -10,9 +10,8 @@
 //!   the error is collected. After the plan's state is persisted the tick returns `Err` listing
 //!   every failed action, so callers still learn about it. Only store (SQLite) errors abort.
 //!
-//! What differs between callers is only what the process can physically do, behind [`Hands`]:
-//! starting provider sessions and delivering tells through a provider (CLI) versus queueing
-//! for a spawning executor and writing the inbox (daemon).
+//! Callers provide [`Hands`] for physical actions; the daemon uses a [`Launcher`] adapter
+//! to start workers and its appender to record trace events without reentering the API.
 //!
 //! Ticks are serialized in-process ([`TICK_LOCK`]) and across processes (an `flock` on
 //! `$TACHO_HOME/decide.lock`), so a CLI tick and a daemon tick never execute two plans
@@ -39,6 +38,12 @@ use identity::{AgentProcess, Identity, Signalled};
 /// Error kind a [`Hands::deliver_tell`] returns when delivering would resume a session whose
 /// old process may still own the worktree. Recorded as `tell_refused`, not as a failure.
 pub const RESUME_REFUSED: io::ErrorKind = io::ErrorKind::ResourceBusy;
+
+/// Starts project processes from either an API tick or the autonomous sampler.
+pub trait Launcher: Send + Sync {
+    /// Starts and records a worker in its allocated worktree.
+    fn spawn_worker(&self, store: &mut FleetStore, item: &TodoItem) -> io::Result<u32>;
+}
 
 /// What a caller of [`run_tick`] can physically do.
 pub trait Hands {
@@ -361,19 +366,28 @@ pub fn run_tick(
 
     let tick_start_ns = now_ns();
     let mut refresh_errors = Vec::new();
-    if !opts.dry_run {
-        if let Some(forge) = opts.forge {
-            let outcome = observe::refresh_world(
-                store,
-                forge,
-                opts.repo.as_deref(),
-                hands,
-                opts.refresh_timeout,
-            )?;
-            refresh_errors = outcome.errors;
+    let mut state = store.load()?;
+    if let Some(forge) = opts.forge {
+        let outcome = observe::refresh_world(
+            store,
+            forge,
+            opts.repo
+                .as_deref()
+                .or_else(|| state.repo_root.as_deref().map(Path::new)),
+            hands,
+            opts.refresh_timeout,
+            !opts.dry_run,
+        )?;
+        refresh_errors = outcome.errors;
+        if opts.dry_run && !refresh_errors.is_empty() {
+            return Err(io::Error::other(refresh_errors.join("; ")));
         }
+        state = if opts.dry_run {
+            outcome.observed
+        } else {
+            store.load()?
+        };
     }
-    let state = store.load()?;
     let now = opts.now_override.unwrap_or_else(now_secs);
     let procs = match opts.procs {
         Some(ref p) => p.clone(),
@@ -393,7 +407,10 @@ pub fn run_tick(
         live_state: opts.live_state,
         procs: &procs,
         run_pids: opts.run_pids.clone(),
-        repo: opts.repo.as_deref(),
+        repo: opts
+            .repo
+            .as_deref()
+            .or_else(|| state.repo_root.as_deref().map(Path::new)),
         main_sha,
         root_disk_bytes,
     };
@@ -401,7 +418,7 @@ pub fn run_tick(
     let plan = tacho_core::decide::decide(&decision_state, &world_obs);
 
     if opts.dry_run {
-        print_dry_run(&plan);
+        print_dry_run(&decision_state, &world_obs, &plan)?;
         return Ok(TickOutcome {
             tick_id: None,
             deduped: false,
@@ -430,9 +447,7 @@ pub fn run_tick(
             plan,
         });
     }
-    let tick_id = store.record_decision_tick(now, &decision_state, &world_obs, &plan)?;
-
-    persist_plan_state(store, &plan, now)?;
+    let tick_id = persist_plan_state(store, &state, &decision_state, &world_obs, &plan, now)?;
 
     let mut f = Failures {
         hands,
@@ -477,33 +492,63 @@ pub fn run_tick(
     })
 }
 
-fn print_dry_run(plan: &DecisionPlan) {
-    for id in &plan.duplicate_batch_aborts {
-        println!("would abort duplicate batch {id}");
+fn dry_run_record(
+    state: &DecisionState,
+    observation: &WorldObservation,
+    plan: &DecisionPlan,
+    secrets: &[String],
+) -> io::Result<serde_json::Value> {
+    #[derive(serde::Serialize)]
+    struct Preview<'a> {
+        kind: &'static str,
+        dry_run: bool,
+        state: &'a DecisionState,
+        observation: &'a WorldObservation,
+        plan: &'a DecisionPlan,
     }
-    for b in &plan.burner_kills {
-        println!(
-            "[dry-run] would kill runaway burner pid={} ({}) elapsed={}s",
-            b.pid, b.comm, b.elapsed_secs
-        );
-    }
-    for step in &plan.supervision_actions {
-        match step {
-            SuperviseAction::Ok => {}
-            SuperviseAction::Resume { because, .. }
-            | SuperviseAction::Nudge { because, .. }
-            | SuperviseAction::Escalate { because, .. } => println!("Supervise: {because}"),
+    fn scrub(value: &mut serde_json::Value, scrubber: &tacho_core::Scrubber, secrets: &[String]) {
+        match value {
+            serde_json::Value::String(text) => {
+                *text = scrubber.scrub(text);
+                for secret in secrets.iter().filter(|s| !s.is_empty()) {
+                    *text = text.replace(secret, "<redacted>");
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    scrub(item, scrubber, secrets);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for field in fields.values_mut() {
+                    scrub(field, scrubber, secrets);
+                }
+            }
+            _ => {}
         }
     }
-    for item in &plan.dispatched_tasks {
-        println!("[dry-run] Would dispatch {}", item.key);
-    }
-    for d in &plan.tidy_decisions {
-        println!("[dry-run] {d:?}");
-    }
-    if plan.self_update.target_sha.is_some() {
-        println!("Self-update: {}", plan.self_update.because);
-    }
+    let mut record = serde_json::to_value(Preview {
+        kind: "decision",
+        dry_run: true,
+        state,
+        observation,
+        plan,
+    })
+    .map_err(io::Error::other)?;
+    scrub(&mut record, &tacho_core::Scrubber::enabled(), secrets);
+    Ok(record)
+}
+
+fn print_dry_run(
+    state: &DecisionState,
+    observation: &WorldObservation,
+    plan: &DecisionPlan,
+) -> io::Result<()> {
+    use std::io::Write as _;
+    let env: BTreeMap<String, String> = std::env::vars().collect();
+    let secrets = tacho_core::decide::ops::snapshot::configured_secrets(&env);
+    let record = dry_run_record(state, observation, plan, &secrets)?;
+    writeln!(std::io::stdout().lock(), "{record}")
 }
 
 /// Fix and rebase hand-off tasks the plan asks for, appended to `todo` when not queued yet.
@@ -542,7 +587,14 @@ fn handoff_tasks(plan: &DecisionPlan, mut todo: Vec<TodoItem>, now: i64) -> Vec<
 
 /// Persists `decide`'s next state. Runs before any action so actions that mutate the store
 /// (spawns, resumes, aborts, worktree removal) are never overwritten by it.
-fn persist_plan_state(store: &mut FleetStore, plan: &DecisionPlan, now: i64) -> io::Result<()> {
+fn persist_plan_state(
+    store: &mut FleetStore,
+    observed: &FleetState,
+    decision_state: &DecisionState,
+    observation: &WorldObservation,
+    plan: &DecisionPlan,
+    now: i64,
+) -> io::Result<i64> {
     let next = &plan.next_state;
     let mut todo = plan.dispatched_tasks.clone();
     for item in handoff_tasks(plan, next.todo.clone(), now) {
@@ -551,7 +603,7 @@ fn persist_plan_state(store: &mut FleetStore, plan: &DecisionPlan, now: i64) -> 
         }
     }
     let reaped = !plan.reaped_agents.is_empty();
-    store.mutate(None, |st| {
+    store.commit_tick(observed, now, (decision_state, observation, plan), |st| {
         st.todo = todo;
         st.agents = next.agents.clone();
         if reaped {
@@ -1010,16 +1062,20 @@ fn execute_actions(
     }
     for n in &plan.owner_notifications {
         let mut notify_failed = false;
-        if let Err(e) = f.hands.notify_owner(&n.subject, &n.body) {
-            notify_failed = true;
-            f.record(
-                store,
-                "watch",
-                "notify_owner_failed",
-                &n.key,
-                &format!("failed to notify owner for {}: {e}", n.key),
-                true,
-            )?;
+        let mut delivered = false;
+        match f.hands.notify_owner(&n.subject, &n.body) {
+            Ok(sent) => delivered = sent,
+            Err(e) => {
+                notify_failed = true;
+                f.record(
+                    store,
+                    "watch",
+                    "notify_owner_failed",
+                    &n.key,
+                    &format!("failed to notify owner for {}: {e}", n.key),
+                    true,
+                )?;
+            }
         }
         if let Some(forge) = forge {
             let issue_title = if n.kind == "main_red" || n.kind == "main-red" {
@@ -1027,19 +1083,22 @@ fn execute_actions(
             } else {
                 format!("tacho alert: {}", n.key)
             };
-            if let Err(e) = forge.set_issue(&issue_title, &n.body) {
-                notify_failed = true;
-                f.record(
-                    store,
-                    "watch",
-                    "set_issue_failed",
-                    &n.key,
-                    &format!("failed to set issue '{issue_title}' for {}: {e}", n.key),
-                    true,
-                )?;
+            match forge.set_issue(&issue_title, &n.body) {
+                Ok(issue) => delivered |= issue.is_some(),
+                Err(e) => {
+                    notify_failed = true;
+                    f.record(
+                        store,
+                        "watch",
+                        "set_issue_failed",
+                        &n.key,
+                        &format!("failed to set issue '{issue_title}' for {}: {e}", n.key),
+                        true,
+                    )?;
+                }
             }
         }
-        if notify_failed {
+        if notify_failed || !delivered {
             store.mutate(None, |st| {
                 st.notified_failures.remove(&n.key);
             })?;
@@ -1049,31 +1108,38 @@ fn execute_actions(
     }
     if let Some(alert) = &plan.watchdog_alert {
         let mut alert_failed = false;
-        if let Err(e) = f.hands.notify_owner("tacho is down", alert) {
-            alert_failed = true;
-            f.record(
-                store,
-                "watch",
-                "watchdog_alert_failed",
-                "tick",
-                &format!("failed to notify owner of watchdog alert: {e}"),
-                true,
-            )?;
-        }
-        if let Some(forge) = forge {
-            if let Err(e) = forge.set_issue("tacho is down", alert) {
+        let mut delivered = false;
+        match f.hands.notify_owner("tacho is down", alert) {
+            Ok(sent) => delivered = sent,
+            Err(e) => {
                 alert_failed = true;
                 f.record(
                     store,
                     "watch",
                     "watchdog_alert_failed",
                     "tick",
-                    &format!("failed to set 'tacho is down' issue: {e}"),
+                    &format!("failed to notify owner of watchdog alert: {e}"),
                     true,
                 )?;
             }
         }
-        if alert_failed {
+        if let Some(forge) = forge {
+            match forge.set_issue("tacho is down", alert) {
+                Ok(issue) => delivered |= issue.is_some(),
+                Err(e) => {
+                    alert_failed = true;
+                    f.record(
+                        store,
+                        "watch",
+                        "watchdog_alert_failed",
+                        "tick",
+                        &format!("failed to set 'tacho is down' issue: {e}"),
+                        true,
+                    )?;
+                }
+            }
+        }
+        if alert_failed || !delivered {
             let prev_ts = state.last_watchdog_alert_ts;
             store.mutate(None, |st| {
                 st.last_watchdog_alert_ts = prev_ts;
@@ -1163,3 +1229,6 @@ fn supervise_resume(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod shadow_tests;

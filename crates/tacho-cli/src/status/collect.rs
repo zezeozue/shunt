@@ -345,6 +345,7 @@ pub fn build_snapshot_from_fleet(state: &FleetState, at: i64, now: i64) -> Statu
         &state.holds,
         &current_main,
         &HashMap::new(),
+        &state.area_rules,
     );
     let ready_json: Vec<serde_json::Value> = ready_list
         .iter()

@@ -198,6 +198,7 @@ pub fn execute_land_with(args: LandOptions) -> io::Result<()> {
         &state.holds,
         &current_main,
         &HashMap::new(),
+        &state.area_rules,
     );
     if ready.is_empty() {
         println!("Nothing ready to land.");

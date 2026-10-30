@@ -197,10 +197,6 @@ pub struct DecisionPlan {
 /// supervision, batch verification, landing, notification, and self-update decision without IO.
 pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
     let mut next = state.clone();
-    if next.max_parallel == 0 {
-        next.max_parallel = 4;
-    }
-
     // 1. Update merged and closed PR sets from world observation.
     for &m in &obs.merged_prs {
         next.merged_prs.insert(m);
@@ -563,6 +559,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         &next.holds,
         &obs.main_sha,
         &HashMap::new(),
+        &next.area_rules,
     );
     let tidy_min_age = if next.tidy_min_age_secs > 0 {
         next.tidy_min_age_secs
@@ -697,10 +694,23 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         }
     }
 
+    let verified_trains: Vec<_> = obs
+        .ready_trains
+        .iter()
+        .filter(|(_, order, heads)| {
+            !order.is_empty()
+                && order.iter().all(|pr| {
+                    ready_prs
+                        .iter()
+                        .any(|item| item.pr == *pr && heads.get(pr) == Some(&item.sha))
+                })
+        })
+        .cloned()
+        .collect();
     let owner_notifications = decide_owner_notifications(
         &attention_items,
         &next.batches,
-        &obs.ready_trains,
+        &verified_trains,
         &failed_main_jobs,
         &obs.deploy_runs,
         &next.notified_keys,
@@ -774,6 +784,7 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
 }
 
 /// Evaluate [`decide`] after applying a unified [`ProjectPolicy`] to the state.
+/// Existing worker limits, including zero, take precedence over policy defaults.
 pub fn decide_with_policy(
     state: &DecisionState,
     obs: &WorldObservation,
@@ -786,3 +797,6 @@ pub fn decide_with_policy(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod migration_safety_tests;

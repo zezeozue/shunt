@@ -37,6 +37,9 @@ pub mod watch;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod readiness_tests;
+
 pub use batch::{
     execute_batch, execute_batch_with, execute_flakes, has_proptest_counterexample,
     launch_detached_batch, select_batch_checks, BatchOptions, BatchOrigin,

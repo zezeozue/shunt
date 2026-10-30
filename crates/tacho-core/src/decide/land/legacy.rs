@@ -76,7 +76,11 @@ pub fn still_ready(
     current_main: &str,
     merged_prs_since: &[u64],
 ) -> bool {
-    if !pr.state.eq_ignore_ascii_case("OPEN") {
+    if !pr.state.eq_ignore_ascii_case("OPEN")
+        || pr.draft
+        || pr.head.is_empty()
+        || current_main.is_empty()
+    {
         return false;
     }
     if pr.mergeable.eq_ignore_ascii_case("CONFLICTING") {
@@ -85,13 +89,21 @@ pub fn still_ready(
     if holds.contains_key(&format!("pr:{}", pr.number)) {
         return false;
     }
-    if pr.head != record.sha {
+    if pr.number != record.pr || pr.head != record.sha {
         return false;
     }
     let Some(b) = batch else {
         return false;
     };
-    if b.status != "passed" || !b.flakes.is_empty() {
+    if b.status != "passed"
+        || !b.flakes.is_empty()
+        || b.id != record.batch_id
+        || b.main_sha != record.main_sha
+        || !b.prs.contains(&pr.number)
+        || b.shas.get(&pr.number) != Some(&record.sha)
+        || record.tree.is_empty()
+        || b.tree.as_ref() != Some(&record.tree)
+    {
         return false;
     }
     if current_main == record.main_sha {
@@ -116,6 +128,7 @@ pub fn queue(
     holds: &BTreeMap<String, Hold>,
     current_main: &str,
     merged_prs_since: &HashMap<String, Vec<u64>>,
+    rules: &[AreaRule],
 ) -> Vec<ReadyItem> {
     let batch_by_id: HashMap<&str, &BatchRun> =
         batches.iter().map(|b| (b.id.as_str(), b)).collect();
@@ -126,6 +139,13 @@ pub fn queue(
             continue;
         };
         let b = batch_by_id.get(rec.batch_id.as_str()).copied();
+        let required = areas_for_files(&pr.files, rules);
+        if pr.files.is_empty()
+            || required.iter().any(|area| !rec.areas.contains(area))
+            || b.is_none_or(|batch| required.iter().any(|area| !batch.areas.contains(area)))
+        {
+            continue;
+        }
         let since = merged_prs_since
             .get(&rec.main_sha)
             .map(Vec::as_slice)

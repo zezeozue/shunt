@@ -14,7 +14,7 @@ use tacho_core::decide::dispatch::{
     resolve_with_providers, retire, retire_problem, with_hold, without_hold, TodoItem,
     STALE_HOLD_SECS,
 };
-use tacho_core::decide::land::{open_for, queue};
+use tacho_core::decide::land::{open_for, queue, train_refusal};
 use tacho_core::decide::verify::{batches, slug_problem};
 use tacho_core::{Scrubber, TaskStatus};
 use tacho_daemon::FleetState;
@@ -571,7 +571,7 @@ pub fn compute_next_instruction(st: &FleetState, live: &BTreeSet<String>, now: i
         .open_prs_cache
         .iter()
         .filter(|pr| {
-            !pr.draft
+            pr.state.eq_ignore_ascii_case("OPEN")
                 && pr.mergeable.eq_ignore_ascii_case("CONFLICTING")
                 && !st.holds.contains_key(&format!("pr:{}", pr.number))
                 && !agent_held_prs.contains(&pr.number)
@@ -613,8 +613,25 @@ pub fn compute_next_instruction(st: &FleetState, live: &BTreeSet<String>, now: i
         );
     }
 
+    let current_main = st.main_sha.as_deref().unwrap_or("");
+    let ready = queue(
+        &st.open_prs_cache,
+        &st.passed,
+        &st.batches,
+        &st.holds,
+        current_main,
+        &HashMap::new(),
+        &st.area_rules,
+    );
     if let Some(train) = open_for(&st.trains) {
-        if !train.prs.is_empty() {
+        if !train.prs.is_empty()
+            && train_refusal(train, current_main, &st.open_prs_cache, &st.holds).is_none()
+            && train
+                .prs
+                .iter()
+                .filter(|n| !train.landed_prs.contains(n))
+                .all(|n| ready.iter().any(|item| item.pr == *n))
+        {
             let pr_list = train
                 .prs
                 .iter()
@@ -624,14 +641,12 @@ pub fn compute_next_instruction(st: &FleetState, live: &BTreeSet<String>, now: i
             return format!("ask the owner to land train {} (PRs {})", train.id, pr_list);
         }
     }
-    let ready_prs: Vec<u64> = st
-        .passed
-        .keys()
-        .copied()
+    let ready_prs: Vec<u64> = ready
+        .into_iter()
+        .map(|item| item.pr)
         .filter(|pr| {
             !st.merged_prs.contains(pr)
                 && !st.closed_prs.contains(pr)
-                && !st.holds.contains_key(&format!("pr:{pr}"))
                 && !st.failed.contains_key(pr)
         })
         .collect();
@@ -718,15 +733,6 @@ pub fn execute_next(args: NextArgs) -> io::Result<()> {
         &state.merged_prs,
         &state.closed_prs,
     );
-    let _ = queue(
-        &state.open_prs_cache,
-        &state.passed,
-        &state.batches,
-        &state.holds,
-        "",
-        &HashMap::new(),
-    );
-
     if args.json {
         let raw = serde_json::to_string_pretty(&serde_json::json!({
             "instruction": instruction,

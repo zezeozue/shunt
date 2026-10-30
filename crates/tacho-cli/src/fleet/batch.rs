@@ -2,6 +2,8 @@
 //! origin-aware retry/bisection (`Daemon`, `Manual`, `Train`), detached background mode
 //! with env-file precedence, and area hang timeout reporting.
 
+mod checkout;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -432,8 +434,9 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 areas.insert(a);
             }
         } else {
-            shas.insert(n, main_sha.clone());
-            areas.insert("workspace".to_string());
+            return Err(io::Error::other(format!(
+                "PR #{n} has no observed head or changed files"
+            )));
         }
     }
     let (selected_areas, mut checks) = select_batch_checks_for_origin(
@@ -503,8 +506,6 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
     }
 
     let batch_id = new_batch_id(&state.batches);
-    let mut tree_sha = crate::kit::tree_of_worktree(&cwd).unwrap_or_else(|_| main_sha.clone());
-
     if opts.dry_run {
         println!("Batch ID: {batch_id}");
         println!("Origin:   {}", opts.origin.as_str());
@@ -518,19 +519,30 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
 
     let now = now_secs();
     let batch_start_ns = now_ns();
+    let heads: Vec<&str> = pr_nums
+        .iter()
+        .map(|number| {
+            shas.get(number)
+                .map(String::as_str)
+                .ok_or_else(|| io::Error::other("batch head is missing"))
+        })
+        .collect::<io::Result<_>>()?;
+    let checkout = checkout::BatchCheckout::new(&cwd, &main_sha)?;
+    let tree_sha = checkout.prepare(&main_sha, &heads)?;
+    let check_cwd = checkout.path();
     let check_cmd = if let Some(ref custom_cmd) = opts.cmd {
         custom_cmd.clone()
     } else {
         let candidate_wf = state.workflow_path.clone().or_else(|| {
             for rel in [".github/workflows/ci.yml", ".github/workflows/ci.yaml"] {
-                if cwd.join(rel).is_file() {
+                if check_cwd.join(rel).is_file() {
                     return Some(rel.to_string());
                 }
             }
             None
         });
         if let Some(wf_path) = candidate_wf {
-            let raw_wf = fs::read_to_string(cwd.join(&wf_path)).map_err(|e| {
+            let raw_wf = fs::read_to_string(check_cwd.join(&wf_path)).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("failed to read workflow '{wf_path}': {e}"),
@@ -565,7 +577,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 }
                 let j_argv = job_argv(
                     &ci_job,
-                    cwd.to_str().unwrap_or("."),
+                    check_cwd.to_str().unwrap_or("."),
                     svc_name.as_deref(),
                     &[],
                 );
@@ -618,6 +630,8 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
     record_batch_pid_identity(&batch_id, std::process::id())?;
     let fleet_tmp = private_tmp_dir(&format!("batch-{batch_id}"))?;
     let run_probe = |k: usize, label: &str| -> io::Result<(bool, bool, String, u64, u64)> {
+        let prefix_heads: Vec<&str> = heads.iter().copied().take(k).collect();
+        let expected_tree = checkout.prepare(&main_sha, &prefix_heads)?;
         let p_start = now_ns();
         let prefix_prs: Vec<String> = pr_nums.iter().take(k).map(|n| n.to_string()).collect();
         let units_csv: Vec<String> = checks
@@ -632,7 +646,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             "-c",
             &check_cmd,
         ])
-        .current_dir(&cwd);
+        .current_dir(check_cwd);
         apply_private_tmp_env(&mut cmd, &fleet_tmp);
         for (ek, ev) in &merged_env {
             cmd.env(ek, ev);
@@ -658,6 +672,9 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         );
         let txt = Scrubber::new().scrub(&raw_txt);
         let timed_out = out.status.code() == Some(124) || out.status.code() == Some(137);
+        if out.status.success() {
+            checkout.verify_unchanged(&expected_tree)?;
+        }
         Ok((out.status.success(), timed_out, txt, p_start, p_end))
     };
 
@@ -667,14 +684,14 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
-                let p = cwd.join(".tachoshots");
+                let p = check_cwd.join(".tachoshots");
                 p.is_dir().then_some(p)
             })
         {
             let recorded_head = if shas.len() == 1 {
                 shas.values().next().cloned().unwrap_or_default()
             } else {
-                super::store::git_stdout(&cwd, &["rev-parse", "HEAD"]).unwrap_or_default()
+                super::store::git_stdout(check_cwd, &["rev-parse", "HEAD"]).unwrap_or_default()
             };
             let _ = super::train::persist_shot_report_to_run_dir(
                 &report_dir,
@@ -683,9 +700,9 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             );
             let fix_shots = opts.origin == BatchOrigin::Train
                 || std::env::var("TACHO_FIX_SHOTS").ok().as_deref() == Some("1");
-            let shot_rules = super::train::load_shot_rules(&cwd);
+            let shot_rules = super::train::load_shot_rules(check_cwd);
             match super::train::stage_and_commit_merged_screenshots(
-                &cwd,
+                check_cwd,
                 &report_dir,
                 &batch_id,
                 &all_files,
@@ -693,9 +710,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 &shot_rules,
             ) {
                 Ok(Some(_new_commit)) => {
-                    if let Ok(updated_tree) = crate::kit::tree_of_worktree(&cwd) {
-                        tree_sha = updated_tree;
-                    }
+                    return Err(io::Error::other("generated screenshots need collecting into the PR heads before verification"));
                 }
                 Ok(None) => {}
                 Err(shot_err) => {

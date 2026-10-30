@@ -104,6 +104,19 @@ pub fn spawn_worker_in_dir(
     item: &TodoItem,
     wt_override: Option<&Path>,
 ) -> io::Result<u32> {
+    spawn_worker_with_trace(store, item, wt_override, true)
+}
+
+pub(crate) fn spawn_daemon_worker(store: &mut FleetStore, item: &TodoItem) -> io::Result<u32> {
+    spawn_worker_with_trace(store, item, None, false)
+}
+
+fn spawn_worker_with_trace(
+    store: &mut FleetStore,
+    item: &TodoItem,
+    wt_override: Option<&Path>,
+    send_trace: bool,
+) -> io::Result<u32> {
     let state = store.load()?;
     let inferred_prov = item.provider.clone().or_else(|| {
         item.model
@@ -308,7 +321,10 @@ pub fn spawn_worker_in_dir(
         &because,
         now_ns(),
     )?;
-    emit_decision_event(&format!("agent:{}", item.key), "dispatch:start", &because);
+    // API ticks already occupy a socket worker; tracing back through that socket can deadlock.
+    if send_trace {
+        emit_decision_event(&format!("agent:{}", item.key), "dispatch:start", &because);
+    }
     Ok(pid)
 }
 

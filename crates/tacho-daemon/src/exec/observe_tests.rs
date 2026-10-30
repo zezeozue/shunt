@@ -187,6 +187,7 @@ fn test_refresh_world_updates_state_and_retains_last_known_on_forge_failure() {
         None,
         &mut hands,
         Duration::from_secs(2),
+        true,
     )
     .unwrap();
     assert!(out1.changed);
@@ -205,6 +206,7 @@ fn test_refresh_world_updates_state_and_retains_last_known_on_forge_failure() {
         None,
         &mut hands,
         Duration::from_secs(2),
+        true,
     )
     .unwrap();
     assert!(!out2.changed);
@@ -221,6 +223,7 @@ fn test_refresh_world_updates_state_and_retains_last_known_on_forge_failure() {
         None,
         &mut hands,
         Duration::from_secs(2),
+        true,
     )
     .unwrap();
     assert!(!out3.changed);

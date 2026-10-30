@@ -63,6 +63,8 @@ impl Default for RingConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SamplerConfig {
+    /// Observe fleet plans without executing actions or updating fleet state.
+    pub dry_run: bool,
     /// Polling interval in milliseconds (default: 2000 ms).
     pub interval_ms: u64,
     /// Filesystem mount points to monitor via statvfs (default: ["/"]).
@@ -82,6 +84,7 @@ pub struct SamplerConfig {
 impl Default for SamplerConfig {
     fn default() -> Self {
         Self {
+            dry_run: false,
             interval_ms: 2000,
             mounts: vec!["/".to_string()],
             cgroup: true,

@@ -477,6 +477,7 @@ pub fn execute_queue(args: QueueArgs) -> io::Result<()> {
         &state.holds,
         &current_main,
         &HashMap::new(),
+        &state.area_rules,
     );
     if args.json {
         println!(

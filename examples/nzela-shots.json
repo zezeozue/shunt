@@ -1,0 +1,26 @@
+{
+  "area_roots": [
+    ["console", "frontend/admin/"],
+    ["android", "frontend/android/"]
+  ],
+  "shot_dirs": [
+    ["console", "frontend/admin/screenshots/"],
+    ["android", "frontend/android/docs/screenshots/"]
+  ],
+  "generated_prefixes": [
+    "frontend/admin/screenshots/",
+    "frontend/admin/docs/",
+    "frontend/android/docs/"
+  ],
+  "aliases": {
+    "home": "dashboard",
+    "settings": "preferences",
+    "funding": "treasury",
+    "provider": "treasury"
+  },
+  "shared_compose": ["components", "theme", "design", "nav", "system"],
+  "screenshot_tests_marker": "app/src/test/java/app/nzela/screenshot/",
+  "screen_dirs": {
+    "console": "frontend/admin/src/screens"
+  }
+}

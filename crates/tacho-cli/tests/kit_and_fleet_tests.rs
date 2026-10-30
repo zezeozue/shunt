@@ -84,6 +84,175 @@ fn init_git_repo(dir: &Path) -> String {
 }
 
 #[test]
+fn the_daemon_starts_a_queued_worker_in_its_allocated_worktree() {
+    daemon_worker_case(false);
+}
+
+#[test]
+fn a_dry_run_daemon_leaves_workers_queued_even_when_it_has_a_launcher() {
+    daemon_worker_case(true);
+}
+
+fn daemon_worker_case(dry_run: bool) {
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::UnixStream;
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let runtime = tmp.path().join("runtime");
+    let repo = tmp.path().join("repo");
+    let worktrees = tmp.path().join("worktrees");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    let sha = init_git_repo(&repo);
+    assert!(Command::new("git")
+        .args(["remote", "add", "origin"])
+        .arg(&repo)
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+    let start = tacho_cmd()
+        .args(["start", "daemon-worker", "--base", &sha, "--dir"])
+        .arg(&worktrees)
+        .env("TACHO_HOME", &home)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let todo = tacho_cmd()
+        .args([
+            "todo",
+            "daemon-worker",
+            "Record the worker directory",
+            "--area",
+            "docs",
+        ])
+        .env("TACHO_HOME", &home)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(todo.status.success());
+
+    // Arm the directory watch before starting the daemon; socket creation wakes the test.
+    let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    assert!(raw >= 0);
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let path = std::ffi::CString::new(runtime.as_os_str().as_bytes()).unwrap();
+    assert!(
+        unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_CREATE) } >= 0
+    );
+    let _daemon = ChildGuard(
+        tacho_cmd()
+            .args(if dry_run {
+                vec!["daemon", "--dry-run"]
+            } else {
+                vec!["daemon"]
+            })
+            .current_dir(&repo)
+            .env("TACHO_HOME", &home)
+            .env("TACHO_RUNTIME", &runtime)
+            .env("TACHO_REPO", &repo)
+            .env("TACHO_OPEN_PRS_JSON", "[]")
+            .env(
+                "TACHO_MAIN_CI_JSON",
+                serde_json::json!({"id":1,"status":"completed",
+            "conclusion":"success","sha":sha,"title":"CI","age_seconds":0})
+                .to_string(),
+            )
+            .env(
+                "TACHO_AGENT_CMD",
+                "cat >/dev/null; pwd > worker-directory; printf 'PR: none\\n'",
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = runtime.join("api.sock");
+    let mut events = [0u8; 4096];
+    while !socket.exists() {
+        let count = unsafe { libc::read(fd.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
+        assert!(count > 0, "directory watch failed");
+    }
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"cmd":"tick", "main_sha":sha})
+    )
+    .unwrap();
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).unwrap();
+    let response: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(response["status"], "ok", "{reply}");
+    let state = FleetStore::open(&home.join("events.sqlite"))
+        .unwrap()
+        .load()
+        .unwrap();
+    if dry_run {
+        assert!(state.agents.is_empty());
+        assert!(state.todo.iter().any(|item| item.key == "daemon-worker"));
+        assert!(!worktrees.join("daemon-worker/worker-directory").exists());
+    } else {
+        let agent = state
+            .agents
+            .get("daemon-worker")
+            .expect("daemon must start the queued worker");
+        let pid = agent.pid.expect("worker must have a real process");
+        wait_pid_exit(pid);
+        let expected = worktrees.join("daemon-worker");
+        assert_eq!(Path::new(&agent.worktree), expected);
+        assert_eq!(
+            fs::read_to_string(expected.join("worker-directory"))
+                .unwrap()
+                .trim(),
+            expected.to_str().unwrap()
+        );
+        assert!(!repo.join("worker-directory").exists());
+        assert!(!state.todo.iter().any(|item| item.key == "daemon-worker"));
+    }
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"input":{"type":"custom",
+        "track":"test", "op":"instant", "name":"after-worker-start"}})
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut reply = String::new();
+    reader.read_line(&mut reply).unwrap();
+    writeln!(reader.get_mut(), "{{\"cmd\":\"flush\"}}").unwrap();
+    reply.clear();
+    reader.read_line(&mut reply).unwrap();
+    let events = tacho_daemon::EventLog::open(&home.join("events.sqlite"))
+        .unwrap()
+        .load_all()
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.custom_name.as_deref() == Some("after-worker-start")),
+        "worker state changes must not discard recorder events"
+    );
+}
+
+#[test]
 fn test_kit_start_prove_and_pr_preflight() {
     let tmp = tempfile::tempdir().unwrap();
     let tacho_home = tmp.path().join("tacho-home");

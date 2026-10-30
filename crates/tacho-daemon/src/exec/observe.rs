@@ -1033,12 +1033,14 @@ pub fn run_argv(cwd: Option<&Path>, argv: &[String], timeout: Duration) -> Resul
 }
 
 /// Outcome of refreshing world state (`open_prs`, `main_sha`, `main_ci`) from the forge and git.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RefreshOutcome {
     /// `true` when any persisted world field (`open_prs_cache`, `main_sha`, `main_ci`) changed.
     pub changed: bool,
     /// Any forge/git refresh errors encountered (last-known state is preserved for failed fields).
     pub errors: Vec<String>,
+    /// Fresh observations over the original state, including in read-only mode.
+    pub observed: FleetState,
 }
 
 /// Queries the forge (`open_prs`, `main_ci_run`) and remote/local `main` SHA with bounded waits,
@@ -1049,6 +1051,7 @@ pub fn refresh_world(
     repo: Option<&Path>,
     hands: &mut dyn super::Hands,
     timeout: Duration,
+    persist: bool,
 ) -> std::io::Result<RefreshOutcome> {
     let state = store.load()?;
     let now = super::now_secs();
@@ -1062,33 +1065,43 @@ pub fn refresh_world(
                 Ok(prs) => Some(prs),
                 Err(e) => {
                     let msg = format!("forge {} open_prs refresh failed: {e}", forge.forge_name());
-                    store.record_decision(
-                        "watch",
-                        "refresh_open_prs_failed",
-                        forge.forge_name(),
-                        &msg,
-                    )?;
-                    hands.emit("system", "watch:attention", &msg);
+                    if persist {
+                        store.record_decision(
+                            "watch",
+                            "refresh_open_prs_failed",
+                            forge.forge_name(),
+                            &msg,
+                        )?;
+                        hands.emit("system", "watch:attention", &msg);
+                    }
                     outcome.errors.push(msg);
                     None
                 }
             },
         };
 
+    let workflow = state
+        .workflow_path
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("CI");
     let new_ci =
         match env_json::<tacho_core::decide::ops::snapshot::MainCiRun>("TACHO_MAIN_CI_JSON") {
             Some(ci) => Some(Some(ci)),
-            None => match forge.main_ci_run("main", "CI", &mut runner) {
+            None => match forge.main_ci_run("main", workflow, &mut runner) {
                 Ok(ci) => Some(ci),
                 Err(e) => {
                     let msg = format!("forge {} main_ci refresh failed: {e}", forge.forge_name());
-                    store.record_decision(
-                        "watch",
-                        "refresh_main_ci_failed",
-                        forge.forge_name(),
-                        &msg,
-                    )?;
-                    hands.emit("system", "watch:attention", &msg);
+                    if persist {
+                        store.record_decision(
+                            "watch",
+                            "refresh_main_ci_failed",
+                            forge.forge_name(),
+                            &msg,
+                        )?;
+                        hands.emit("system", "watch:attention", &msg);
+                    }
                     outcome.errors.push(msg);
                     None
                 }
@@ -1117,21 +1130,24 @@ pub fn refresh_world(
         .is_some_and(|sha| state.main_sha.as_ref() != Some(sha));
     outcome.changed = prs_changed || ci_changed || sha_changed;
 
-    if new_prs.is_some() || new_ci.is_some() || new_sha.is_some() {
-        store.mutate(None, |st| {
-            if let Some(prs) = new_prs {
-                st.open_prs_cache = prs;
-                st.world_refreshed_at.insert("prs".to_string(), now);
-            }
-            if let Some(ci) = new_ci {
-                st.main_ci = ci;
-                st.world_refreshed_at.insert("ci".to_string(), now);
-            }
-            if let Some(sha) = new_sha {
-                st.main_sha = Some(sha);
-                st.world_refreshed_at.insert("main".to_string(), now);
-            }
-        })?;
+    let update = |st: &mut FleetState| {
+        if let Some(prs) = &new_prs {
+            st.open_prs_cache = prs.clone();
+            st.world_refreshed_at.insert("prs".to_string(), now);
+        }
+        if let Some(ci) = &new_ci {
+            st.main_ci = ci.clone();
+            st.world_refreshed_at.insert("ci".to_string(), now);
+        }
+        if let Some(sha) = &new_sha {
+            st.main_sha = Some(sha.clone());
+            st.world_refreshed_at.insert("main".to_string(), now);
+        }
+    };
+    outcome.observed = state;
+    update(&mut outcome.observed);
+    if persist && (new_prs.is_some() || new_ci.is_some() || new_sha.is_some()) {
+        store.mutate(None, update)?;
     }
 
     Ok(outcome)

@@ -29,7 +29,7 @@ pub fn spawn_sampler(
     let control = Arc::new(SamplerControl::new(None));
     std::thread::Builder::new()
         .name("tacho-sampler".to_string())
-        .spawn(move || run_sampler_loop(config, appender, stop_flag, None, control, None))
+        .spawn(move || run_sampler_loop(config, appender, stop_flag, None, control, None, None))
         .expect("failed to spawn sampler thread")
 }
 
@@ -147,6 +147,17 @@ pub fn spawn_sampler_with_home(
     stop_flag: Arc<AtomicBool>,
     home_dir: Option<std::path::PathBuf>,
 ) -> io::Result<(std::thread::JoinHandle<()>, SamplerWaker)> {
+    spawn_sampler_with_launcher(config, appender, stop_flag, home_dir, None)
+}
+
+/// Spawns the sampler with the daemon's project process launcher.
+pub fn spawn_sampler_with_launcher(
+    config: SamplerConfig,
+    appender: AppenderHandle,
+    stop_flag: Arc<AtomicBool>,
+    home_dir: Option<std::path::PathBuf>,
+    launcher: Option<Arc<dyn crate::exec::Launcher>>,
+) -> io::Result<(std::thread::JoinHandle<()>, SamplerWaker)> {
     use std::os::fd::FromRawFd;
     let mut fds = [-1i32; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
@@ -166,7 +177,15 @@ pub fn spawn_sampler_with_home(
     let handle = std::thread::Builder::new()
         .name("tacho-sampler".to_string())
         .spawn(move || {
-            run_sampler_loop(config, appender, stop_flag, Some(read), control, home_dir)
+            run_sampler_loop(
+                config,
+                appender,
+                stop_flag,
+                Some(read),
+                control,
+                home_dir,
+                launcher,
+            )
         })?;
     Ok((handle, waker))
 }
@@ -178,10 +197,13 @@ fn run_sampler_loop(
     wake: Option<std::os::fd::OwnedFd>,
     control: Arc<SamplerControl>,
     home_dir: Option<std::path::PathBuf>,
+    launcher: Option<Arc<dyn crate::exec::Launcher>>,
 ) {
     let interval = Duration::from_millis(config.interval_ms.max(100));
     let mut proc_sampler = ProcSampler::new(&config.mounts);
-    proc_sampler.set_cgroup_enabled(config.cgroup);
+    proc_sampler.set_cgroup_enabled(config.cgroup && !config.dry_run);
+    proc_sampler.set_dry_run(config.dry_run);
+    proc_sampler.set_launcher(launcher);
     proc_sampler.set_worktree_scan_secs(config.worktree_scan_secs);
     proc_sampler.set_decide_refresh_secs(config.decide_refresh_secs);
     proc_sampler.set_decide_request_flag(control.decide_requested.clone());

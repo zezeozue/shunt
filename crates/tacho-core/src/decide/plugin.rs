@@ -474,12 +474,16 @@ pub fn parse_gh_run_list(stdout: &str) -> Result<Option<MainCiRun>, String> {
         }))
 }
 
-/// Parses `gh pr list --json number,title,headRefName,baseRefName,headRefOid,mergeable,isDraft,labels`.
+/// Parses open pull heads, labels and complete file lists from the forge.
 pub fn parse_gh_pr_list(stdout: &str) -> Result<Vec<PullFacts>, String> {
     #[derive(Deserialize)]
     struct Label {
         #[serde(default)]
         name: String,
+    }
+    #[derive(Deserialize)]
+    struct File {
+        path: String,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -499,9 +503,19 @@ pub fn parse_gh_pr_list(stdout: &str) -> Result<Vec<PullFacts>, String> {
         is_draft: bool,
         #[serde(default)]
         labels: Vec<Label>,
+        #[serde(default)]
+        files: Vec<File>,
+        #[serde(default)]
+        changed_files: Option<usize>,
     }
     let prs: Vec<Pr> = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("unexpected PR list output: {e}"))?;
+    if prs.iter().any(|pr| {
+        pr.changed_files
+            .is_some_and(|count| count != pr.files.len())
+    }) {
+        return Err("forge returned an incomplete PR file list".into());
+    }
     let mut out: Vec<PullFacts> = prs
         .into_iter()
         .map(|p| {
@@ -517,6 +531,7 @@ pub fn parse_gh_pr_list(stdout: &str) -> Result<Vec<PullFacts>, String> {
                 mergeable: p.mergeable,
                 draft: p.is_draft,
                 labels,
+                files: p.files.into_iter().map(|file| file.path).collect(),
                 ..Default::default()
             }
         })
@@ -530,6 +545,8 @@ pub fn parse_gh_pr_list(stdout: &str) -> Result<Vec<PullFacts>, String> {
 pub struct MockForge {
     /// Value returned by [`ForgePlugin::main_ci_run`]; `Err` simulates a forge failure.
     pub main_ci: Result<Option<MainCiRun>, String>,
+    /// Recorded `main_ci_run(branch, workflow)` calls.
+    pub ci_requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     /// Value returned by [`ForgePlugin::open_prs`]; `Err` simulates a forge failure.
     pub open_prs: Result<Vec<PullFacts>, String>,
     /// Recorded `set_issue(title, body)` calls.
@@ -556,6 +573,7 @@ impl Default for MockForge {
     fn default() -> Self {
         Self {
             main_ci: Ok(None),
+            ci_requests: std::sync::Arc::default(),
             open_prs: Ok(Vec::new()),
             issues: std::sync::Arc::default(),
             closed_issues: std::sync::Arc::default(),
@@ -597,10 +615,14 @@ impl ForgePlugin for MockForge {
     }
     fn main_ci_run(
         &self,
-        _branch: &str,
-        _workflow: &str,
+        branch: &str,
+        workflow: &str,
         _run: &mut dyn FnMut(&[String]) -> Result<String, String>,
     ) -> Result<Option<MainCiRun>, String> {
+        self.ci_requests
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((branch.to_string(), workflow.to_string()));
         self.main_ci.clone()
     }
     fn open_prs(
@@ -852,7 +874,7 @@ impl ForgePlugin for CliForgePlugin {
                 "--limit",
                 "200",
                 "--json",
-                "number,title,headRefName,baseRefName,headRefOid,mergeable,isDraft,labels",
+                "number,title,headRefName,baseRefName,headRefOid,mergeable,isDraft,labels,files,changedFiles",
             ]
             .map(String::from),
         );
@@ -2019,9 +2041,6 @@ impl ProjectPolicy {
 
     /// Apply this `ProjectPolicy` onto a [`DecisionState`](crate::decide::DecisionState).
     pub fn apply_to_state(&self, state: &mut crate::decide::DecisionState) {
-        if state.max_parallel == 0 && self.dispatch.slots > 0 {
-            state.max_parallel = self.dispatch.slots as usize;
-        }
         if state.area_rules.is_empty() {
             state.area_rules = self.area_rules.clone();
         }

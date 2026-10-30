@@ -165,6 +165,8 @@ impl ConnRegistry {
 
 /// State shared by the acceptors, the trace thread and the API workers.
 struct ServerShared {
+    dry_run: bool,
+    launcher: Option<Arc<dyn crate::exec::Launcher>>,
     stop: Arc<AtomicBool>,
     pipe: ShutdownPipe,
     conns: ConnRegistry,
@@ -205,7 +207,7 @@ impl DaemonServer {
         shutdown_flag: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let lock = DaemonLock::acquire_paths(&paths)?;
-        Self::start_with_lock(paths, lock, appender, shutdown_flag)
+        Self::start_with_lock(paths, lock, appender, shutdown_flag, false)
     }
 
     /// Starts the servers on `api.sock` and `trace.sock` using an already-acquired [`DaemonLock`].
@@ -214,6 +216,19 @@ impl DaemonServer {
         lock: DaemonLock,
         appender: AppenderHandle,
         shutdown_flag: Arc<AtomicBool>,
+        dry_run: bool,
+    ) -> io::Result<Self> {
+        Self::start_with_launcher(paths, lock, appender, shutdown_flag, dry_run, None)
+    }
+
+    /// Starts API workers with the daemon's project process launcher.
+    pub fn start_with_launcher(
+        paths: DaemonPaths,
+        lock: DaemonLock,
+        appender: AppenderHandle,
+        shutdown_flag: Arc<AtomicBool>,
+        dry_run: bool,
+        launcher: Option<Arc<dyn crate::exec::Launcher>>,
     ) -> io::Result<Self> {
         // We hold the lock, so any socket file present is a leftover from an unclean exit.
         for sock in [paths.api_sock(), paths.trace_sock()] {
@@ -232,6 +247,8 @@ impl DaemonServer {
         trace_listener.set_nonblocking(true)?;
 
         let shared = Arc::new(ServerShared {
+            dry_run,
+            launcher,
             stop: shutdown_flag,
             pipe: ShutdownPipe::new()?,
             conns: ConnRegistry::default(),
@@ -814,10 +831,11 @@ fn wait_peer_hangup(fd: RawFd, shutdown_fd: RawFd) {
 /// request's `main_sha`, else resolved with git in the request's `repo`. Without one the
 /// tick is refused instead of logging an empty SHA.
 fn handle_decide(val: &serde_json::Value, shared: &ServerShared) -> Vec<u8> {
-    let dry_run = val
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let dry_run = shared.dry_run
+        || val
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
     let main_sha = val
         .get("main_sha")
@@ -839,8 +857,14 @@ fn handle_decide(val: &serde_json::Value, shared: &ServerShared) -> Vec<u8> {
 
     let live_state = shared.appender.live_state();
     let explicit_sha = (!main_sha.is_empty()).then_some(main_sha);
-    match crate::fleet::execute_decide_tick(&shared.paths.home, &live_state, explicit_sha, dry_run)
-    {
+    match crate::fleet::execute_decide_tick_with_launcher(
+        &shared.paths.home,
+        &live_state,
+        explicit_sha,
+        dry_run,
+        shared.launcher.clone(),
+        Some(shared.appender.clone()),
+    ) {
         Ok((tick_id, _decision_state, _world_obs, plan)) => {
             let mut resp = serde_json::json!({ "status": "ok", "plan": plan });
             if let Some(id) = tick_id {

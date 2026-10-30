@@ -6,6 +6,18 @@ use tacho_daemon::{Config, Daemon, DaemonPaths};
 use crate::cli::DaemonArgs;
 use crate::paths::{ensure_dir_0700, resolve_home, resolve_runtime};
 
+struct ProcessLauncher;
+
+impl tacho_daemon::exec::Launcher for ProcessLauncher {
+    fn spawn_worker(
+        &self,
+        store: &mut tacho_daemon::FleetStore,
+        item: &tacho_core::decide::dispatch::TodoItem,
+    ) -> std::io::Result<u32> {
+        crate::fleet::session::spawn_daemon_worker(store, item)
+    }
+}
+
 /// Runs the tachograph flight recorder daemon server.
 pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
     let home = resolve_home();
@@ -15,13 +27,8 @@ pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
     ensure_dir_0700(&runtime).map_err(|e| e.to_string())?;
 
     let paths = DaemonPaths::custom(&home, &runtime).map_err(|e| e.to_string())?;
-    let mut config = Config::load_or_default(&paths.config_file()).unwrap_or_else(|e| {
-        eprintln!(
-            "[tacho-daemon] ignoring invalid config {}: {e}; using defaults",
-            paths.config_file().display()
-        );
-        Config::default()
-    });
+    let mut config = Config::load_or_default(&paths.config_file()).map_err(|e| e.to_string())?;
+    config.sampler.dry_run |= args.dry_run;
 
     if let Some(otlp) = args.otlp {
         config.otlp_addr = Some(otlp);
@@ -31,7 +38,12 @@ pub fn run_daemon(args: DaemonArgs) -> Result<(), String> {
     }
 
     // `Daemon::start` records `daemon.pid` atomically once its sockets are up.
-    let mut daemon = Daemon::start(paths.clone(), config).map_err(|e| e.to_string())?;
+    let mut daemon = Daemon::start_with_launcher(
+        paths.clone(),
+        config,
+        Some(std::sync::Arc::new(ProcessLauncher)),
+    )
+    .map_err(|e| e.to_string())?;
     let pid_file = runtime.join("daemon.pid");
 
     // Wait until daemon receives shutdown signal via kernel signal-hook self-pipe (no sleep loop)

@@ -6,6 +6,65 @@ use tacho_core::decide::plugin::MockForge;
 use tacho_core::decide::verify::{BatchMode, BatchRun};
 use tacho_core::decide::watch::{HUNG_SECS, STALLED_SECS};
 
+#[test]
+fn a_tick_cannot_overwrite_a_batch_that_finished_during_observation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = FleetStore::open(&directory.path().join("events.sqlite")).unwrap();
+    let observed = store.load().unwrap();
+    assert!(observed.batches.is_empty());
+    let decision_state = observe::decision_state_of(&observed, 10);
+    let world = WorldObservation::default();
+    let plan = tacho_core::decide::decide(&decision_state, &world);
+    store
+        .mutate(None, |state| {
+            state.batches.push(BatchRun {
+                id: "completed-during-observation".to_string(),
+                status: "passed".to_string(),
+                tree: Some("verified-tree".to_string()),
+                ..Default::default()
+            });
+        })
+        .unwrap();
+    let result = persist_plan_state(&mut store, &observed, &decision_state, &world, &plan, 10);
+    assert!(
+        result.is_err(),
+        "a superseded tick must refuse its state update"
+    );
+    let after = store.load().unwrap();
+    assert!(after
+        .batches
+        .iter()
+        .any(|batch| batch.id == "completed-during-observation" && batch.status == "passed"));
+}
+
+#[test]
+fn a_rejected_tick_journal_write_preserves_the_observed_fleet_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("events.sqlite");
+    let mut store = FleetStore::open(&database).unwrap();
+    let before = store.load().unwrap();
+    rusqlite::Connection::open(&database).unwrap().execute_batch(
+        "CREATE TRIGGER reject_tick BEFORE INSERT ON decision_ticks BEGIN SELECT RAISE(ABORT, 'journal unavailable'); END;"
+    ).unwrap();
+    let live = tacho_core::LiveState::default();
+    let mut hands = DaemonHands {
+        home: directory.path().to_path_buf(),
+        live_state: live.clone(),
+        appender: None,
+        launcher: None,
+    };
+    let mut options = TickOptions::new(&live);
+    options.now_override = Some(10);
+    options.explicit_main_sha = Some("main".to_string());
+    options.procs = Some(Vec::new());
+    assert!(run_tick(directory.path(), &mut store, &mut hands, options).is_err());
+    assert_eq!(
+        store.load().unwrap(),
+        before,
+        "a tick without a journal must not commit its state"
+    );
+}
+
 /// RAII guard that kills a test child process (and its process group) and reaps it on drop.
 struct ChildGuard {
     child: std::process::Child,
@@ -72,6 +131,7 @@ fn test_run_tick_persists_real_progress_samples_and_replays_identically() {
         home: home.to_path_buf(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
 
     // Tick 1 at t = 1000: first sample is recorded; agent is Moving (0 supervision actions).
@@ -233,6 +293,7 @@ fn test_run_tick_with_mock_forge_refreshes_world_and_clears_main_broken() {
         home: home.to_path_buf(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.repo = Some(repo);
@@ -297,6 +358,7 @@ fn test_run_tick_forwards_owner_notifications_and_watchdog_alerts_to_forge_issue
         home: home.to_path_buf(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.explicit_main_sha = Some("b".repeat(40));
@@ -383,6 +445,7 @@ fn test_run_tick_retries_failed_owner_notifications_and_watchdog_alerts_on_next_
         home: home.to_path_buf(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts1 = TickOptions::new(&live);
     opts1.explicit_main_sha = Some("b".repeat(40));
@@ -619,6 +682,7 @@ fn test_retired_main_checkout_survives_tidy_with_index_and_untracked_files_intac
         home: home.clone(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.explicit_main_sha = Some("a".repeat(40));
@@ -750,6 +814,7 @@ fn test_worker_running_in_main_checkout_is_stopped_with_page() {
         home: home.clone(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.explicit_main_sha = Some("a".repeat(40));
@@ -862,6 +927,7 @@ fn test_holder_directory_worker_is_not_mistaken_for_main_checkout() {
         home: home.clone(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let mut opts = TickOptions::new(&live);
     opts.repo = Some(fleet_main);
@@ -958,6 +1024,7 @@ fn test_ordinary_stall_escalation_notifies_owner_without_killing_worker() {
         home: home.clone(),
         live_state: live.clone(),
         appender: None,
+        launcher: None,
     };
     let t_escalate = 1_000 + STALLED_SECS + 120;
     let mut opts = TickOptions::new(&live);
@@ -1060,6 +1127,7 @@ fn test_root_disk_check_in_tick_warns_and_prunes_volumes_and_clears_on_recovery(
             home: home.clone(),
             live_state: live.clone(),
             appender: None,
+            launcher: None,
         },
         prune_script: fake_prune,
     };

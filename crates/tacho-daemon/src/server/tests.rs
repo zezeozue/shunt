@@ -17,6 +17,8 @@ impl Fixture {
         let log = EventLog::open(&paths.events_db()).unwrap();
         let (appender, thread) = spawn_appender(Recorder::new(), log, capacity);
         let shared = Arc::new(ServerShared {
+            launcher: None,
+            dry_run: false,
             stop: Arc::new(AtomicBool::new(false)),
             pipe: ShutdownPipe::new().unwrap(),
             conns: ConnRegistry::default(),

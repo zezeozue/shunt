@@ -7,7 +7,7 @@ use std::path::Path;
 
 use tacho_core::decide::dispatch::{builtin_providers, AgentRun, Hold, PullFacts, STALE_HOLD_SECS};
 use tacho_core::decide::land::TrainRecord;
-use tacho_core::decide::verify::{AreaRule, FailedRecord, PassedRecord};
+use tacho_core::decide::verify::{AreaRule, FailedRecord};
 use tacho_core::decide::watch::{ProcEntry, TidyDecision};
 use tacho_daemon::{DecisionRecord, FleetState, FleetStore};
 
@@ -212,19 +212,12 @@ fn next_priority_order_hands_then_fix_then_land_then_stale_hold_then_working_the
         "got: {inst_stale}"
     );
 
-    // 3. Ready PR to land beats stale hold
-    st.passed.insert(
-        20,
-        PassedRecord {
-            pr: 20,
-            sha: "abc".to_string(),
-            main_sha: "base".to_string(),
-            batch_id: "b001".to_string(),
-            passed_at: now,
-            tree: "tree".to_string(),
-            areas: vec!["core".to_string()],
-        },
-    );
+    let verified = super::readiness_tests::verified_state();
+    st.passed = verified.passed;
+    st.batches = verified.batches;
+    st.open_prs_cache = verified.open_prs_cache;
+    st.area_rules = verified.area_rules;
+    st.main_sha = verified.main_sha;
     let inst_land = compute_next_instruction(&st, &live, now);
     assert!(
         inst_land.contains("ask the owner to land PR #20"),

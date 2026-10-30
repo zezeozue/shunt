@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::log::EventLog;
 use crate::paths::DaemonPaths;
 use crate::recorder::Recorder;
-use crate::sampler::{spawn_sampler_with_home, SamplerWaker};
+use crate::sampler::{timer::spawn_sampler_with_launcher, SamplerWaker};
 use crate::server::{DaemonLock, DaemonServer};
 use crate::snapshot::{write_snapshot, write_snapshot_file_atomic, SnapshotStats};
 
@@ -40,6 +40,15 @@ pub struct Daemon {
 impl Daemon {
     /// Initializes and starts all daemon subsystems per design section 1 and 8.
     pub fn start(paths: DaemonPaths, config: Config) -> io::Result<Self> {
+        Self::start_with_launcher(paths, config, None)
+    }
+
+    /// Starts the daemon with an adapter for project process execution.
+    pub fn start_with_launcher(
+        paths: DaemonPaths,
+        config: Config,
+        launcher: Option<Arc<dyn crate::exec::Launcher>>,
+    ) -> io::Result<Self> {
         paths.ensure_dirs()?;
 
         // 0. Acquire single-instance advisory locks on both $TACHO_RUNTIME/daemon.lock and
@@ -73,7 +82,11 @@ impl Daemon {
             failing_repeats: config.detectors.failing_count,
         });
 
-        let on_stall = config.detectors.on_stall.clone();
+        let on_stall = if config.sampler.dry_run {
+            None
+        } else {
+            config.detectors.on_stall.clone()
+        };
         let on_stall_timeout = Duration::from_secs(config.detectors.on_stall_timeout_secs);
 
         // Fallible setup that needs no threads happens first, so an error here cannot leak
@@ -96,11 +109,12 @@ impl Daemon {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
 
         // 4. Spawn sampler thread (also runs autonomous `decide` ticks on $TACHO_HOME)
-        let (sampler_thread, sampler_waker) = match spawn_sampler_with_home(
+        let (sampler_thread, sampler_waker) = match spawn_sampler_with_launcher(
             config.sampler.clone(),
             appender.clone(),
             shutdown_flag.clone(),
             Some(paths.home.clone()),
+            launcher.clone(),
         ) {
             Ok(pair) => pair,
             Err(e) => {
@@ -112,11 +126,13 @@ impl Daemon {
         appender.set_sampler_waker(sampler_waker.clone());
 
         // 5. Start UNIX domain socket servers (api.sock, trace.sock) using the acquired lock
-        let server = match DaemonServer::start_with_lock(
+        let server = match DaemonServer::start_with_launcher(
             paths.clone(),
             lock,
             appender.clone(),
             shutdown_flag.clone(),
+            config.sampler.dry_run,
+            launcher,
         ) {
             Ok(server) => server,
             Err(e) => {
@@ -139,12 +155,16 @@ impl Daemon {
 
         // 6. Spawn retention maintenance thread (hourly small-batch prune)
         let (retention_wake_tx, retention_wake_rx) = crossbeam_channel::bounded::<()>(1);
-        let retention_thread = spawn_retention_thread(
-            config.retention_days,
-            paths.clone(),
-            shutdown_flag.clone(),
-            retention_wake_rx,
-        );
+        let retention_thread = if config.sampler.dry_run {
+            None
+        } else {
+            Some(spawn_retention_thread(
+                config.retention_days,
+                paths.clone(),
+                shutdown_flag.clone(),
+                retention_wake_rx,
+            ))
+        };
 
         // 7. Register SIGINT / SIGTERM signal handler
         let (signal_handle, signal_thread) =
@@ -203,7 +223,7 @@ impl Daemon {
             otlp_shutdown_fds,
             sampler_thread: Some(sampler_thread),
             sampler_waker,
-            retention_thread: Some(retention_thread),
+            retention_thread,
             appender_thread: Some(appender_thread),
             signal_thread,
         })
@@ -275,6 +295,10 @@ impl Drop for Daemon {
         self.stop();
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_shadow_tests.rs"]
+mod shadow_tests;
 
 /// Joins a daemon thread, reporting a panic instead of discarding it.
 fn join_logged(name: &str, handle: JoinHandle<()>) {

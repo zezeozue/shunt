@@ -47,6 +47,18 @@ tacho trace -o trace.perfetto-trace
 ./scripts/oracle.sh
 ```
 
+For a fleet migration, run `tacho daemon --dry-run --foreground` with an isolated
+`TACHO_HOME` and `TACHO_RUNTIME`. It refreshes forge observations and writes one
+scrubbed JSON decision record per tick, including the inputs and complete plan.
+It executes no fleet actions, stall hooks, cgroup attachments or retention
+pruning. API tick requests also remain read-only in this mode. A failed forge
+observation is an error, not a successful preview of stale data.
+
+The one-shot equivalent is `tacho tick --dry-run`. See
+[the parity table](docs/parity.md) for the behaviours that still need comparison
+before replacing a running fleet. Manual worker and batch commands have broader
+execution support than the autonomous daemon; the table identifies those gaps.
+
 > **Path Isolation:** By default, persistent state is stored in `$TACHO_HOME` (`${XDG_STATE_HOME:-~/.local/state}/tacho`) and sockets/locks in `$TACHO_RUNTIME` (`${XDG_RUNTIME_DIR:-/tmp}/tacho-$UID`). When `TACHO_HOME` is explicitly set and `TACHO_RUNTIME` is unset, runtime sockets automatically isolate inside `$TACHO_HOME/run` (falling back to `/tmp/tacho-<hash>` if the socket path would exceed 100 bytes).
 
 ---

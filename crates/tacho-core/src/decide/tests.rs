@@ -1069,6 +1069,7 @@ fn test_unified_replayable_decide_function() {
         prs: vec![50],
         shas: BTreeMap::from([(50, "sha50".to_string())]),
         main_sha: "main-sha-1".to_string(),
+        areas: vec!["tacho-core".to_string()],
         status: "running".to_string(),
         started_at: 900,
         ..Default::default()
@@ -1694,6 +1695,7 @@ fn test_multi_tick_adversarial_simulation_across_all_concerns() {
     let mut b3 = running_batch("b-3", vec![101]);
     b3.main_sha = "main-001".to_string();
     b3.shas = BTreeMap::from([(101, "sha-101".to_string())]);
+    b3.areas = vec!["core".to_string()];
     state5.batches.push(b3);
 
     let obs5 = WorldObservation {
@@ -1937,7 +1939,8 @@ mod torture_proptests {
                     std::slice::from_ref(&batch),
                     &holds,
                     "main-1",
-                    &HashMap::new()
+                    &HashMap::new(),
+                    &[]
                 )
                 .is_empty()
             );

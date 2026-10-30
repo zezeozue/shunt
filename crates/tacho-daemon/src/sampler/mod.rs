@@ -105,6 +105,8 @@ pub struct ProcSampler {
     session_run_tracks: HashMap<SessionKey, String>,
     worktree_states: HashMap<String, WorktreeSnapshot>,
     cgroup_enabled: bool,
+    dry_run: bool,
+    launcher: Option<std::sync::Arc<dyn crate::exec::Launcher>>,
     worktree_scan_secs: u64,
     home_dir: Option<std::path::PathBuf>,
     fleet_store: Option<crate::fleet::FleetStore>,
@@ -151,6 +153,8 @@ impl ProcSampler {
             session_run_tracks: HashMap::new(),
             worktree_states: HashMap::new(),
             cgroup_enabled: true,
+            dry_run: false,
+            launcher: None,
             worktree_scan_secs: 30,
             home_dir: None,
             fleet_store: None,
@@ -164,9 +168,19 @@ impl ProcSampler {
         }
     }
 
+    /// Sets the process launcher used by autonomous ticks.
+    pub fn set_launcher(&mut self, launcher: Option<std::sync::Arc<dyn crate::exec::Launcher>>) {
+        self.launcher = launcher;
+    }
+
     /// Sets whether cgroup accounting is enabled.
     pub fn set_cgroup_enabled(&mut self, enabled: bool) {
         self.cgroup_enabled = enabled;
+    }
+
+    /// Keeps autonomous ticks read-only when observing another fleet.
+    pub fn set_dry_run(&mut self, enabled: bool) {
+        self.dry_run = enabled;
     }
 
     /// Sets the minimum interval between worktree file-change scans in seconds.
@@ -563,10 +577,12 @@ impl ProcSampler {
                     }
                 }
                 if let Some(ref mut store) = self.fleet_store {
+                    store.attach_appender(appender.clone());
                     let mut hands = crate::fleet::DaemonHands {
                         home: home_dir.clone(),
                         live_state: (*latest_live).clone(),
                         appender: Some(appender.clone()),
+                        launcher: self.launcher.clone(),
                     };
                     let gh_forge = if self.decide_forge.is_none() {
                         std::env::var("TACHO_GH_REPO")
@@ -577,6 +593,7 @@ impl ProcSampler {
                         None
                     };
                     let mut opts = crate::exec::TickOptions::new(&latest_live);
+                    opts.dry_run = self.dry_run;
                     if let Some(ref f) = self.decide_forge {
                         opts.forge = Some(f.as_ref());
                     } else if let Some(ref f) = gh_forge {
@@ -590,6 +607,10 @@ impl ProcSampler {
                     match crate::exec::run_tick(home_dir, store, &mut hands, opts) {
                         Ok(_) => {
                             self.record_decide_success(effective_seq, now_ns);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            self.record_decide_success(effective_seq, now_ns);
+                            self.decide_requested.store(true, Ordering::Release);
                         }
                         Err(e) => {
                             self.record_decide_failure(effective_seq, now_ns);

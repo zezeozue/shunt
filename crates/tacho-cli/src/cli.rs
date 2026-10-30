@@ -272,6 +272,10 @@ pub enum Commands {
 
 #[derive(Args, Debug)]
 pub struct DaemonArgs {
+    /// Observe and print decision plans without executing fleet actions.
+    #[arg(long)]
+    pub dry_run: bool,
+
     /// Optional OTLP HTTP listen address.
     ///
     /// Example: --otlp 127.0.0.1:4318
@@ -1164,4 +1168,19 @@ pub struct ShotsAcceptArgs {
 pub struct ShotsFixArgs {
     /// Batch run ID, PR number, or shot-report directory to inspect.
     pub target: String,
+}
+
+#[cfg(test)]
+mod shadow_tests {
+    use super::*;
+
+    #[test]
+    fn the_daemon_accepts_a_read_only_shadow_mode() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["tacho", "daemon", "--dry-run", "--foreground"])?;
+        assert!(matches!(
+            cli.command,
+            Commands::Daemon(DaemonArgs { dry_run: true, .. })
+        ));
+        Ok(())
+    }
 }
