@@ -245,6 +245,29 @@ pub fn decide_owner_notifications(
         });
     }
 
+    let mut announced_trains = BTreeSet::new();
+    let mut announced_members = BTreeSet::new();
+    for key in already_notified {
+        if let Some(rest) = key.strip_prefix("ready:") {
+            if let Some((prev_train, members_csv)) = rest.split_once(':') {
+                if !prev_train.is_empty() {
+                    announced_trains.insert(prev_train);
+                }
+                for member in members_csv.split(',').filter(|m| !m.is_empty()) {
+                    announced_members.insert(member);
+                }
+            }
+        } else if let Some(prev_train) = key.strip_prefix("ready-train:") {
+            if !prev_train.is_empty() {
+                announced_trains.insert(prev_train);
+            }
+        } else if let Some(member) = key.strip_prefix("ready-pr:") {
+            if !member.is_empty() {
+                announced_members.insert(member);
+            }
+        }
+    }
+
     for (train_id, order, heads) in ready_trains {
         if train_id.is_empty() || order.is_empty() {
             continue;
@@ -255,7 +278,11 @@ pub fn decide_owner_notifications(
             head_parts.push(format!("{pr}:{}", crate::char_prefix(sha, 8)));
         }
         let key = format!("ready:{train_id}:{}", head_parts.join(","));
-        if already_notified.contains(&key) {
+        let all_members_already_announced = announced_trains.contains(train_id.as_str())
+            && head_parts
+                .iter()
+                .all(|part| announced_members.contains(part.as_str()));
+        if already_notified.contains(&key) || all_members_already_announced {
             continue;
         }
         let pr_list = order

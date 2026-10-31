@@ -24,9 +24,9 @@ impl EventLog {
         )?;
 
         // Configure WAL mode and performance pragmas
+        conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "cache_size", -64000)?;
 
@@ -123,7 +123,9 @@ impl EventLog {
             return Ok(());
         }
 
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO events (seq, ts_ns, kind, track_key, cause_seq, agent, body, counter_value, custom_name)

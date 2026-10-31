@@ -118,7 +118,7 @@ fn resolve_home_path() -> PathBuf {
 /// 2. `$TACHO_HOME/run` (when `$TACHO_HOME` is explicitly set; falls back to `/tmp/tacho-<hash>` if path > 100 bytes)
 /// 3. `$XDG_RUNTIME_DIR/tacho`
 /// 4. `$TACHO_HOME/run`
-fn resolve_runtime_path(home: &Path) -> PathBuf {
+pub(crate) fn resolve_runtime_path(home: &Path) -> PathBuf {
     if let Ok(val) = env::var("TACHO_RUNTIME") {
         if !val.trim().is_empty() {
             return PathBuf::from(val);

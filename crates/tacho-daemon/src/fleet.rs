@@ -102,6 +102,12 @@ pub struct FleetState {
     /// Recorded main repository checkout path for this fleet; `None` when not yet configured.
     #[serde(default)]
     pub repo_root: Option<String>,
+    /// Epoch seconds when the last daily digest was delivered to the owner (or initialized).
+    #[serde(default)]
+    pub digest_sent_at: Option<i64>,
+    /// Accumulated `(timestamp_secs, line)` events pending inclusion in the next daily digest.
+    #[serde(default)]
+    pub digest_entries: Vec<(i64, String)>,
 }
 
 impl Default for FleetState {
@@ -152,6 +158,8 @@ impl Default for FleetState {
             world_refreshed_at: BTreeMap::new(),
             merge_prs: false,
             repo_root: None,
+            digest_sent_at: None,
+            digest_entries: Vec::new(),
         }
     }
 }
@@ -197,11 +205,11 @@ impl FleetStore {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .map_err(sql_err)?;
+        conn.pragma_update(None, "busy_timeout", 5000)
+            .map_err(sql_err)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(sql_err)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(sql_err)?;
-        conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(sql_err)?;
 
         let existing_tables: i64 = conn
@@ -458,6 +466,47 @@ impl FleetStore {
         Ok(out)
     }
 
+    /// Attempts to forward trace inputs to a running daemon over its UNIX domain `api.sock`
+    /// so external CLI processes share the daemon's in-memory sequence allocator when online.
+    fn try_send_inputs_via_api_sock(&self, inputs: &[tacho_core::Input]) -> bool {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        if self.home.as_os_str().is_empty() {
+            return false;
+        }
+        let primary = crate::paths::resolve_runtime_path(&self.home).join("api.sock");
+        let fallback = self.home.join("run/api.sock");
+        let mut candidates = vec![primary];
+        if fallback != candidates[0] {
+            candidates.push(fallback);
+        }
+        for sock in candidates {
+            if !sock.exists() {
+                continue;
+            }
+            let Ok(mut stream) = UnixStream::connect(&sock) else {
+                continue;
+            };
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let Ok(mut line) = serde_json::to_vec(&serde_json::json!({ "inputs": inputs })) else {
+                return false;
+            };
+            line.push(b'\n');
+            if stream.write_all(&line).is_err() || stream.flush().is_err() {
+                continue;
+            }
+            let mut reader = BufReader::new(stream);
+            let mut resp = String::new();
+            if reader.read_line(&mut resp).is_ok() && resp.contains("\"status\":\"ok\"") {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Appends a contiguous state band transition (`Kind::TaskState`) on `track_key` into the
     /// SQLite `events` table so `tacho trace` renders task and train lifecycles as state bands.
     pub fn emit_state_band(
@@ -468,33 +517,36 @@ impl FleetStore {
         because: &str,
         ts_ns: u64,
     ) -> io::Result<()> {
+        let input = if let Some(slug) = track_key
+            .strip_prefix("task:")
+            .and_then(|s| s.strip_suffix("/state"))
+        {
+            tacho_core::Input::TaskState {
+                source_ts_ns: Some(ts_ns),
+                slug: slug.to_string(),
+                state: status,
+                because: Some(because.to_string()),
+            }
+        } else {
+            tacho_core::Input::Custom {
+                source_ts_ns: Some(ts_ns),
+                track: track_key.to_string(),
+                op: tacho_core::CustomOp::State,
+                name: Some(label.to_string()),
+                id: None,
+                args: BTreeMap::from([("because".to_string(), because.to_string())]),
+                value: None,
+                flow_out: None,
+                flow_in: None,
+            }
+        };
         if let Some(appender) = &self.appender {
-            let input = if let Some(slug) = track_key
-                .strip_prefix("task:")
-                .and_then(|s| s.strip_suffix("/state"))
-            {
-                tacho_core::Input::TaskState {
-                    source_ts_ns: Some(ts_ns),
-                    slug: slug.to_string(),
-                    state: status,
-                    because: Some(because.to_string()),
-                }
-            } else {
-                tacho_core::Input::Custom {
-                    source_ts_ns: Some(ts_ns),
-                    track: track_key.to_string(),
-                    op: tacho_core::CustomOp::State,
-                    name: Some(label.to_string()),
-                    id: None,
-                    args: BTreeMap::from([("because".to_string(), because.to_string())]),
-                    value: None,
-                    flow_out: None,
-                    flow_in: None,
-                }
-            };
             return appender
                 .send_input(input, ts_ns)
                 .map_err(|error| io::Error::other(error.to_string()));
+        }
+        if self.try_send_inputs_via_api_sock(&[input]) {
+            return Ok(());
         }
         let proto_state: tacho::TaskStatus = status.into();
         let ev_body = tacho::Event {
@@ -567,13 +619,12 @@ impl FleetStore {
         end_ts_ns: u64,
         because: &str,
     ) -> io::Result<()> {
-        if let Some(appender) = &self.appender {
-            let end = end_ts_ns.max(start_ts_ns.saturating_add(1_000_000));
-            let inputs = [
+        let end = end_ts_ns.max(start_ts_ns.saturating_add(1_000_000));
+        let make_inputs = || {
+            [
                 (tacho_core::CustomOp::Begin, start_ts_ns),
                 (tacho_core::CustomOp::End, end),
             ]
-            .into_iter()
             .map(|(op, ts)| {
                 (
                     tacho_core::Input::Custom {
@@ -590,10 +641,15 @@ impl FleetStore {
                     ts,
                 )
             })
-            .collect();
+        };
+        if let Some(appender) = &self.appender {
             return appender
-                .send_input_batch(inputs)
+                .send_input_batch(make_inputs().into_iter().collect())
                 .map_err(|error| io::Error::other(error.to_string()));
+        }
+        let pair: Vec<tacho_core::Input> = make_inputs().into_iter().map(|(inp, _)| inp).collect();
+        if self.try_send_inputs_via_api_sock(&pair) {
+            return Ok(());
         }
         let begin_body = tacho::Event {
             body: Some(tacho::event::Body::Custom(tacho::Custom {
@@ -830,6 +886,14 @@ impl FleetStore {
         obs: &WorldObservation,
         plan: &DecisionPlan,
     ) -> io::Result<Option<i64>> {
+        if !plan.dispatched_tasks.is_empty()
+            || !plan.resumed_tasks.is_empty()
+            || !plan.batch_plans.is_empty()
+            || !plan.owner_notifications.is_empty()
+            || plan.watchdog_alert.is_some()
+        {
+            return Ok(None);
+        }
         let Some((id, prev_state, prev_obs, prev_plan)) = self.load_latest_decision_tick()? else {
             return Ok(None);
         };
@@ -843,6 +907,10 @@ impl FleetStore {
 fn input_fingerprint(state: &DecisionState, obs: &WorldObservation) -> io::Result<u64> {
     let mut state = state.clone();
     state.last_tick_ts = None;
+    state.digest_sent_at = None;
+    for (ts, _) in &mut state.digest_entries {
+        *ts = 0;
+    }
     let mut obs = obs.clone();
     obs.now = 0;
     obs.tidy_snapshot.now = 0;
@@ -863,6 +931,10 @@ fn input_fingerprint(state: &DecisionState, obs: &WorldObservation) -> io::Resul
 fn plan_fingerprint(plan: &DecisionPlan) -> io::Result<u64> {
     let mut plan = plan.clone();
     plan.next_state.last_tick_ts = None;
+    plan.next_state.digest_sent_at = None;
+    for (ts, _) in &mut plan.next_state.digest_entries {
+        *ts = 0;
+    }
     canonical_hash(&plan)
 }
 
@@ -1065,6 +1137,17 @@ impl crate::exec::Hands for DaemonHands {
         self.launcher
             .as_ref()
             .map(|launcher| launcher.spawn_worker(store, item))
+            .transpose()
+    }
+
+    fn spawn_batch(
+        &mut self,
+        store: &mut FleetStore,
+        plan: &tacho_core::decide::verify::BatchPlan,
+    ) -> io::Result<Option<u32>> {
+        self.launcher
+            .as_ref()
+            .map(|launcher| launcher.spawn_batch(store, plan))
             .transpose()
     }
 

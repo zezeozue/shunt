@@ -109,6 +109,14 @@ impl tacho_daemon::exec::Hands for CliHands {
         spawn_worker_for_item(store, item).map(Some)
     }
 
+    fn spawn_batch(
+        &mut self,
+        store: &mut FleetStore,
+        plan: &tacho_core::decide::verify::BatchPlan,
+    ) -> io::Result<Option<u32>> {
+        crate::fleet::batch::spawn_daemon_batch(store, plan).map(Some)
+    }
+
     fn deliver_tell(
         &mut self,
         store: &mut FleetStore,

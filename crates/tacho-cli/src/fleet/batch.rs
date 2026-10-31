@@ -26,7 +26,8 @@ use crate::cli::{BatchArgs, FlakesArgs};
 
 use super::store::{
     emit_decision_event, load_fleet_env, now_ns, now_secs, open_fleet_store,
-    record_batch_pid_identity, resolve_live_main_sha, resolve_live_pr_heads,
+    record_batch_pid_identity, record_batch_pid_identity_in, resolve_live_main_sha,
+    resolve_live_pr_heads,
 };
 use crate::kit::{apply_private_tmp_env, private_tmp_dir, use_private_tmp};
 
@@ -112,12 +113,17 @@ impl From<BatchArgs> for BatchOptions {
             .ok()
             .map(|s| BatchOrigin::parse(&s))
             .unwrap_or(BatchOrigin::Daemon);
+        let cmd = args.cmd.or_else(|| {
+            std::env::var("TACHO_BATCH_CMD")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
         Self {
             prs: args.prs,
             areas,
             foreground,
             origin,
-            cmd: args.cmd,
+            cmd,
             mode: args.mode,
             timeout: args.timeout,
             dry_run: args.dry_run,
@@ -250,12 +256,200 @@ pub fn select_batch_checks_for_origin(
     (effective_areas, checks)
 }
 
+fn upsert_batch_run(batches: &mut Vec<BatchRun>, run: BatchRun) {
+    if let Some(existing) = batches.iter_mut().find(|b| b.id == run.id) {
+        *existing = run;
+    } else {
+        batches.push(run);
+    }
+}
+
+/// Spawns and records a daemon-planned verification batch (`verify/batch_start`).
+pub fn spawn_daemon_batch(
+    store: &mut tacho_daemon::FleetStore,
+    plan: &tacho_core::decide::verify::BatchPlan,
+) -> io::Result<u32> {
+    if plan.prs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("batch {} has no pull requests", plan.id),
+        ));
+    }
+    let state = store.load()?;
+    if state.holds.contains_key(&plan.group)
+        || state.holds.contains_key(&format!("area:{}", plan.group))
+        || plan
+            .prs
+            .iter()
+            .any(|pr| state.holds.contains_key(&format!("pr:{pr}")))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("batch {} is held", plan.id),
+        ));
+    }
+    if state.batches.iter().any(|b| {
+        (b.status == "running" || b.status == "bisecting")
+            && (b.id == plan.id
+                || b.group == plan.group
+                || b.prs.iter().any(|p| plan.prs.contains(p)))
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("batch {} is already running", plan.id),
+        ));
+    }
+
+    let home = if !store.home().as_os_str().is_empty() {
+        store.home().to_path_buf()
+    } else {
+        crate::paths::resolve_home()
+    };
+    let cur_dir = std::env::current_dir().ok();
+    let repo_dir = tacho_daemon::exec::observe::fleet_main_checkout(&state, cur_dir.as_deref())
+        .or(cur_dir)
+        .ok_or_else(|| io::Error::other("cannot resolve repository checkout for batch"))?;
+    if !tacho_daemon::exec::observe::inside_git_checkout(&repo_dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "batch {} repository path '{}' is not a git checkout",
+                plan.id,
+                repo_dir.display()
+            ),
+        ));
+    }
+
+    let has_cmd_override = std::env::var("TACHO_BATCH_CMD")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    if !has_cmd_override {
+        let candidate_wf = state.workflow_path.clone().or_else(|| {
+            for rel in [".github/workflows/ci.yml", ".github/workflows/ci.yaml"] {
+                if repo_dir.join(rel).is_file() {
+                    return Some(rel.to_string());
+                }
+            }
+            None
+        });
+        if let Some(wf_rel) = candidate_wf {
+            let wf_full = repo_dir.join(&wf_rel);
+            if !wf_full.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("workflow file '{}' does not exist", wf_full.display()),
+                ));
+            }
+        } else {
+            let has_rule_cmd = plan.areas.iter().any(|area| {
+                state
+                    .area_rules
+                    .iter()
+                    .any(|r| &r.area == area && !r.checks.is_empty())
+            });
+            if !has_rule_cmd {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "no workflow file or check command configured for batch {} (areas {:?})",
+                        plan.id, plan.areas
+                    ),
+                ));
+            }
+        }
+    }
+
+    let logs_dir = home.join("logs");
+    fs::create_dir_all(&logs_dir)?;
+    let log_path = logs_dir.join(format!("batch-{}.log", plan.id));
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let err_file = log_file.try_clone()?;
+
+    let merged_env = load_fleet_env(None);
+    let exe = crate::client::resolve_tacho_bin();
+    let mut cmd = Command::new(exe);
+    cmd.current_dir(&repo_dir).arg("batch").arg("--foreground");
+    for pr in &plan.prs {
+        cmd.arg(pr.to_string());
+    }
+    if !plan.areas.is_empty() {
+        cmd.args(["--areas", &plan.areas.join(",")]);
+    }
+    for (k, v) in &merged_env {
+        cmd.env(k, v);
+    }
+    use_private_tmp(&mut cmd, &format!("batch-{}", plan.id))?;
+    cmd.env("TACHO_HOME", &home)
+        .env("TACHO_REPO", &repo_dir)
+        .env("TACHO_BATCH_ID", &plan.id)
+        .env("TACHO_BATCH_FOREGROUND", "1")
+        .env("TACHO_BATCH_DETACHED", "0")
+        .env("TACHO_BATCH_ORIGIN", BatchOrigin::Daemon.as_str())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(err_file))
+        .process_group(0);
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let _ = record_batch_pid_identity_in(&home, &plan.id, pid);
+
+    let now = now_secs();
+    let main_sha = state
+        .main_sha
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| resolve_live_main_sha(&repo_dir));
+    let mut shas = BTreeMap::new();
+    for &pr in &plan.prs {
+        if let Some(found) = state.open_prs_cache.iter().find(|p| p.number == pr) {
+            shas.insert(pr, found.head.clone());
+        }
+    }
+    let running_run = BatchRun {
+        id: plan.id.clone(),
+        group: plan.group.clone(),
+        prs: plan.prs.clone(),
+        shas,
+        main_sha,
+        areas: plan.areas.clone(),
+        checks: plan.checks.clone(),
+        mode: BatchMode::Presubmit,
+        status: "running".to_string(),
+        started_at: now,
+        finished_at: None,
+        tree: None,
+        pid: Some(pid),
+        log: String::new(),
+        culprit: None,
+        skipped: Vec::new(),
+        flakes: Vec::new(),
+    };
+    let because = format!(
+        "started batch {} for PRs {:?} (pid {pid}): {}",
+        plan.id, plan.prs, plan.because
+    );
+    store.mutate(Some(("verify", "batch_start", &plan.id, &because)), |st| {
+        if !st.batches.iter().any(|b| b.id == plan.id) {
+            st.batches.push(running_run);
+        }
+    })?;
+    Ok(pid)
+}
+
 /// Spawns a detached background batch runner writing to `$TACHO_HOME/logs/batch-<id>.log`,
 /// loading the environment file with process-environment precedence, and returns the log path.
 pub fn launch_detached_batch(opts: &BatchOptions) -> io::Result<PathBuf> {
     let mut store = open_fleet_store()?;
     let state = store.load()?;
-    let batch_id = new_batch_id(&state.batches);
+    let batch_id = std::env::var("TACHO_BATCH_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| new_batch_id(&state.batches));
     let home = crate::paths::resolve_home();
     let logs_dir = home.join("logs");
     fs::create_dir_all(&logs_dir)?;
@@ -362,6 +556,34 @@ pub fn execute_batch(args: BatchArgs) -> io::Result<()> {
 
 /// Executes batch verification with full [`BatchOptions`] (`--areas`, `--foreground`/detached, [`BatchOrigin`]).
 pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
+    let forced_id = std::env::var("TACHO_BATCH_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let res = execute_batch_inner(opts);
+    if let (Err(ref err), Some(ref bid)) = (&res, &forced_id) {
+        if let Ok(mut store) = open_fleet_store() {
+            let err_msg = err.to_string();
+            let now = now_secs();
+            let _ = store.mutate(None, |st| {
+                if let Some(b) = st
+                    .batches
+                    .iter_mut()
+                    .find(|b| &b.id == bid && b.status == "running")
+                {
+                    b.status = "failed".to_string();
+                    b.finished_at = Some(now);
+                    b.pid = None;
+                    if b.log.is_empty() {
+                        b.log = err_msg;
+                    }
+                }
+            });
+        }
+    }
+    res
+}
+
+fn execute_batch_inner(opts: BatchOptions) -> io::Result<()> {
     if !opts.foreground && !opts.dry_run {
         let _ = launch_detached_batch(&opts)?;
         return Ok(());
@@ -369,7 +591,10 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
 
     let mut store = open_fleet_store()?;
     let state = store.load()?;
-    let cwd = std::env::current_dir()?;
+    let cur_dir = std::env::current_dir().ok();
+    let cwd = tacho_daemon::exec::observe::fleet_main_checkout(&state, cur_dir.as_deref())
+        .or(cur_dir)
+        .ok_or_else(|| io::Error::other("cannot resolve repository checkout for batch"))?;
 
     let batch_mode = match opts.mode.as_deref().unwrap_or("presubmit") {
         "presubmit" => BatchMode::Presubmit,
@@ -505,7 +730,10 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         return Ok(());
     }
 
-    let batch_id = new_batch_id(&state.batches);
+    let batch_id = std::env::var("TACHO_BATCH_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| new_batch_id(&state.batches));
     if opts.dry_run {
         println!("Batch ID: {batch_id}");
         println!("Origin:   {}", opts.origin.as_str());
@@ -757,7 +985,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         store.mutate(
             Some(("verify", "batch_hang", &batch_id, &hang.summary)),
             |st| {
-                st.batches.push(b_run);
+                upsert_batch_run(&mut st.batches, b_run);
             },
         )?;
         eprintln!("Batch {batch_id} HUNG: {}", hang.summary);
@@ -801,7 +1029,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         store.mutate(
             Some(("verify", "batch_red_once", &batch_id, &because)),
             |st| {
-                st.batches.push(b_run);
+                upsert_batch_run(&mut st.batches, b_run);
             },
         )?;
         emit_decision_event(&format!("batch:{batch_id}"), "verify:red_once", &because);
@@ -869,7 +1097,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
         store.mutate(
             Some(("verify", "batch_head_moved", &batch_id, &moved_reason)),
             |st| {
-                st.batches.push(b_run);
+                upsert_batch_run(&mut st.batches, b_run);
             },
         )?;
         eprintln!("Batch {batch_id} REFUSED: {moved_reason}");
@@ -917,7 +1145,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                 flake_tasks(&updated, &st.todo, &st.agents, &st.retired, finished);
             st.flakes = with_tasks;
             st.todo.extend(new_items);
-            st.batches.push(b_run);
+            upsert_batch_run(&mut st.batches, b_run);
         })?;
         emit_decision_event(&format!("batch:{batch_id}"), "verify:flake", &because);
         eprintln!(
@@ -968,7 +1196,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                     },
                 );
             }
-            st.batches.push(b_run);
+            upsert_batch_run(&mut st.batches, b_run);
         })?;
         for &pr in &pr_nums {
             if let Some(a) = state.agents.values().find(|a| a.pr == Some(pr)) {
@@ -1047,7 +1275,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
             };
             let because = format!("batch {batch_id} aborted: base main is red ({sum})");
             store.mutate(Some(("verify", "main_broken", &batch_id, &because)), |st| {
-                st.batches.push(b_run);
+                upsert_batch_run(&mut st.batches, b_run);
             })?;
             store.emit_duration_slice(
                 &format!("batch:{batch_id}"),
@@ -1108,7 +1336,7 @@ pub fn execute_batch_with(opts: BatchOptions) -> io::Result<()> {
                     );
                 }
             }
-            st.batches.push(b_run);
+            upsert_batch_run(&mut st.batches, b_run);
         })?;
         emit_decision_event(&format!("batch:{batch_id}"), "verify:fail", &because);
         let parent_map = parents(&state.open_prs_cache);

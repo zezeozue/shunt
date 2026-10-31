@@ -253,6 +253,427 @@ fn daemon_worker_case(dry_run: bool) {
 }
 
 #[test]
+fn the_daemon_dispatches_reaps_and_verifies_queued_work_end_to_end() {
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use tacho_core::decide::dispatch::{Hold, ProviderSpec};
+    use tacho_core::decide::verify::AreaRule;
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let runtime = tmp.path().join("runtime");
+    let repo = tmp.path().join("repo");
+    let worktrees = tmp.path().join("worktrees");
+    let prs_json_path = tmp.path().join("open_prs.json");
+    let pr_head_file = tmp.path().join("pr_head.txt");
+    let worker_ready_fifo = tmp.path().join("worker_ready.fifo");
+    let worker_gate_fifo = tmp.path().join("worker_gate.fifo");
+    let provider_script = tmp.path().join("local-provider.sh");
+
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir_all(&runtime).unwrap();
+    fs::write(&prs_json_path, "[]").unwrap();
+
+    for fifo in [&worker_ready_fifo, &worker_gate_fifo] {
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    }
+
+    let _initial_sha = init_git_repo(&repo);
+    let wf_dir = repo.join(".github/workflows");
+    fs::create_dir_all(&wf_dir).unwrap();
+    fs::write(
+        wf_dir.join("ci.yml"),
+        "name: CI\non: [push]\njobs:\n  docs:\n    runs-on: ubuntu-latest\n    steps:\n      - run: test -f worker-change.txt\n",
+    )
+    .unwrap();
+    for args in [
+        &["add", ".github/workflows/ci.yml"][..],
+        &["commit", "-m", "Add CI workflow"][..],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let sha = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(Command::new("git")
+        .args(["remote", "add", "origin"])
+        .arg(&repo)
+        .current_dir(&repo)
+        .status()
+        .unwrap()
+        .success());
+
+    fs::write(
+        &provider_script,
+        format!(
+            "#!/usr/bin/env bash\nset -euo pipefail\ncat >/dev/null || true\necho ready > '{}'\nread -r _ < '{}'\necho 'implemented feature' > worker-change.txt\ngit add worker-change.txt\ngit commit -m 'Implement worker feature'\ngit rev-parse HEAD > '{}'\necho 'PR: #101'\n",
+            worker_ready_fifo.display(),
+            worker_gate_fifo.display(),
+            pr_head_file.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&provider_script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let start = tacho_cmd()
+        .args(["start", "e2e-worker", "--base", &sha, "--dir"])
+        .arg(&worktrees)
+        .env("TACHO_HOME", &home)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        start.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let todo = tacho_cmd()
+        .args([
+            "todo",
+            "e2e-worker",
+            "Implement worker-change.txt and open PR",
+            "--area",
+            "docs",
+        ])
+        .env("TACHO_HOME", &home)
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(todo.status.success());
+
+    let mut store = FleetStore::open(&home.join("events.sqlite")).unwrap();
+    store
+        .mutate(None, |st| {
+            st.repo_root = Some(repo.to_string_lossy().to_string());
+            st.area_rules = vec![AreaRule {
+                area: "docs".into(),
+                prefixes: vec!["worker-change.txt".into(), "README.md".into()],
+                checks: vec![("docs".into(), "test -f worker-change.txt".into())],
+                unit_prefixes: std::collections::BTreeMap::new(),
+                isolate_batch: false,
+                needs_screenshot: false,
+            }];
+            st.providers.insert(
+                "local-prov".into(),
+                ProviderSpec {
+                    name: "local-prov".into(),
+                    binary: provider_script.to_string_lossy().to_string(),
+                    ..Default::default()
+                },
+            );
+            st.providers.insert(
+                "broken-prov".into(),
+                ProviderSpec {
+                    name: "broken-prov".into(),
+                    binary: "/nonexistent/tacho-broken-provider".into(),
+                    ..Default::default()
+                },
+            );
+            st.default_provider = "local-prov".into();
+        })
+        .unwrap();
+
+    let spawn_daemon = |dry_run: bool| -> (ChildGuard, PathBuf) {
+        let _ = fs::remove_file(runtime.join("api.sock"));
+        let raw = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+        assert!(raw >= 0);
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let path = std::ffi::CString::new(runtime.as_os_str().as_bytes()).unwrap();
+        assert!(
+            unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_CREATE) } >= 0
+        );
+        let guard = ChildGuard(
+            tacho_cmd()
+                .args(if dry_run {
+                    vec!["daemon", "--dry-run"]
+                } else {
+                    vec!["daemon"]
+                })
+                .current_dir(&repo)
+                .env("TACHO_HOME", &home)
+                .env("TACHO_RUNTIME", &runtime)
+                .env("TACHO_REPO", &repo)
+                .env(
+                    "TACHO_OPEN_PRS_JSON",
+                    format!("@{}", prs_json_path.display()),
+                )
+                .env(
+                    "TACHO_MAIN_CI_JSON",
+                    serde_json::json!({
+                        "id": 1,
+                        "status": "completed",
+                        "conclusion": "success",
+                        "sha": sha,
+                        "title": "CI",
+                        "age_seconds": 0
+                    })
+                    .to_string(),
+                )
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let socket = runtime.join("api.sock");
+        let mut events = [0u8; 4096];
+        while !socket.exists() {
+            let count =
+                unsafe { libc::read(fd.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
+            assert!(count > 0, "directory watch failed");
+        }
+        (guard, socket)
+    };
+
+    let send_tick = |socket: &Path| -> serde_json::Value {
+        let mut stream = UnixStream::connect(socket).unwrap();
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"cmd": "tick", "main_sha": sha})
+        )
+        .unwrap();
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply).unwrap();
+        serde_json::from_str(&reply).unwrap()
+    };
+
+    // 1. `--dry-run` daemon observes and plans without launching workers or batches.
+    fs::write(
+        &prs_json_path,
+        serde_json::to_string(&vec![PullFacts {
+            number: 101,
+            head: sha.clone(),
+            branch: "e2e-worker".into(),
+            title: "Draft PR".into(),
+            state: "OPEN".into(),
+            draft: true,
+            mergeable: "MERGEABLE".into(),
+            files: vec!["README.md".into()],
+            ..Default::default()
+        }])
+        .unwrap(),
+    )
+    .unwrap();
+    {
+        let (_dry_daemon, dry_sock) = spawn_daemon(true);
+        let resp = send_tick(&dry_sock);
+        assert_eq!(resp["status"], "ok", "{resp}");
+        let st = store.load().unwrap();
+        assert!(st.agents.is_empty(), "dry-run must not start workers");
+        assert!(st.batches.is_empty(), "dry-run must not start batches");
+        assert!(st.todo.iter().any(|t| t.key == "e2e-worker"));
+    }
+    fs::write(&prs_json_path, "[]").unwrap();
+
+    // 2. Real daemon: test slot=0, hold gating, and worker launch failure before normal dispatch.
+    let (_daemon, socket) = spawn_daemon(false);
+
+    store
+        .mutate(None, |st| {
+            st.max_workers = 0;
+        })
+        .unwrap();
+    assert_eq!(send_tick(&socket)["status"], "ok");
+    assert!(store.load().unwrap().agents.is_empty());
+
+    store
+        .mutate(None, |st| {
+            st.max_workers = 2;
+            st.holds.insert(
+                "e2e-worker".into(),
+                Hold {
+                    reason: "paused for test".into(),
+                    since: 100,
+                },
+            );
+        })
+        .unwrap();
+    assert_eq!(send_tick(&socket)["status"], "ok");
+    assert!(store.load().unwrap().agents.is_empty());
+
+    store
+        .mutate(None, |st| {
+            st.holds.remove("e2e-worker");
+            st.default_provider = "broken-prov".into();
+        })
+        .unwrap();
+    let fail_worker_resp = send_tick(&socket);
+    assert_eq!(fail_worker_resp["status"], "error");
+    let st_after_worker_fail = store.load().unwrap();
+    assert!(st_after_worker_fail.agents.is_empty());
+    assert!(
+        st_after_worker_fail
+            .todo
+            .iter()
+            .any(|t| t.key == "e2e-worker"),
+        "failed worker launch must leave task queued in todo"
+    );
+
+    // 3. Valid provider: dispatches worker in allocated worktree, avoids duplicate launch while running,
+    // and reaps the worker + attributes PR #101 after completion.
+    store
+        .mutate(None, |st| {
+            st.default_provider = "local-prov".into();
+        })
+        .unwrap();
+    let dispatch_resp = send_tick(&socket);
+    assert_eq!(dispatch_resp["status"], "ok", "{dispatch_resp}");
+
+    let mut ready_line = String::new();
+    BufReader::new(fs::File::open(&worker_ready_fifo).unwrap())
+        .read_line(&mut ready_line)
+        .unwrap();
+    assert_eq!(ready_line.trim(), "ready");
+
+    let st_running = store.load().unwrap();
+    let running_agent = st_running
+        .agents
+        .get("e2e-worker")
+        .expect("daemon must record running worker");
+    let worker_pid = running_agent.pid.expect("worker pid");
+    assert_eq!(
+        Path::new(&running_agent.worktree),
+        worktrees.join("e2e-worker")
+    );
+    assert!(st_running.todo.is_empty());
+
+    // Another tick while the worker is alive must not spawn a duplicate or reap it early.
+    let while_running_resp = send_tick(&socket);
+    assert_eq!(while_running_resp["status"], "ok", "{while_running_resp}");
+    assert_eq!(
+        store.load().unwrap().agents["e2e-worker"].pid,
+        Some(worker_pid)
+    );
+    assert!(store.load().unwrap().agents["e2e-worker"]
+        .finished_at
+        .is_none());
+
+    // Unblock worker so it commits `worker-change.txt` on branch `e2e-worker` and prints `PR: #101`.
+    writeln!(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&worker_gate_fifo)
+            .unwrap(),
+        "go"
+    )
+    .unwrap();
+    wait_pid_exit(worker_pid);
+
+    let pr_head_sha = fs::read_to_string(&pr_head_file)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(pr_head_sha.len(), 40);
+    fs::write(
+        &prs_json_path,
+        serde_json::to_string(&vec![PullFacts {
+            number: 101,
+            head: pr_head_sha.clone(),
+            branch: "e2e-worker".into(),
+            title: "Implement worker feature".into(),
+            state: "OPEN".into(),
+            draft: true,
+            mergeable: "MERGEABLE".into(),
+            files: vec!["worker-change.txt".into()],
+            ..Default::default()
+        }])
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 4. Batch launch failure leaves PR #101 unbatched for retry, while still reaping the exited worker.
+    store
+        .mutate(None, |st| {
+            st.workflow_path = Some(".github/workflows/missing.yml".into());
+        })
+        .unwrap();
+    let batch_fail_resp = send_tick(&socket);
+    assert_eq!(batch_fail_resp["status"], "error", "{batch_fail_resp}");
+    let st_after_batch_fail = store.load().unwrap();
+    assert_eq!(st_after_batch_fail.agents["e2e-worker"].pr, Some(101));
+    assert!(
+        st_after_batch_fail.batches.is_empty(),
+        "failed batch launch must not leave a phantom batch record"
+    );
+    assert!(st_after_batch_fail.passed.is_empty());
+
+    // 5. Restore workflow_path: next daemon tick launches the verification batch (`b001`),
+    // records its process identity, and completes verification with a PassedRecord and merged tree SHA.
+    store
+        .mutate(None, |st| {
+            st.workflow_path = None;
+        })
+        .unwrap();
+    let batch_ok_resp = send_tick(&socket);
+    assert_eq!(batch_ok_resp["status"], "ok", "{batch_ok_resp}");
+
+    let st_batch_started = store.load().unwrap();
+    let batch_entry = st_batch_started
+        .batches
+        .iter()
+        .find(|b| b.prs == vec![101])
+        .expect("daemon tick must record the started batch");
+    let batch_id = batch_entry.id.clone();
+    if let Some(b_pid) = batch_entry.pid {
+        wait_pid_exit(b_pid);
+    }
+
+    let st_verified = store.load().unwrap();
+    let passed_rec = st_verified
+        .passed
+        .get(&101)
+        .expect("completed batch must record PassedRecord for PR #101");
+    assert_eq!(passed_rec.sha, pr_head_sha);
+    assert_eq!(passed_rec.main_sha, sha);
+    assert!(!passed_rec.tree.is_empty());
+    let finished_batch = st_verified
+        .batches
+        .iter()
+        .find(|b| b.id == batch_id)
+        .unwrap();
+    assert_eq!(finished_batch.status, "passed");
+    assert_eq!(
+        finished_batch.tree.as_deref(),
+        Some(passed_rec.tree.as_str())
+    );
+    let meta_raw = fs::read_to_string(home.join("fleet_meta.json")).unwrap();
+    assert!(
+        meta_raw.contains(&batch_id),
+        "fleet_meta.json must record batch process identity for {batch_id}"
+    );
+
+    // 6. Subsequent tick does not launch a duplicate batch for already-verified PR #101.
+    let after_verify_resp = send_tick(&socket);
+    assert_eq!(after_verify_resp["status"], "ok", "{after_verify_resp}");
+    assert_eq!(store.load().unwrap().batches.len(), 1);
+}
+
+#[test]
 fn test_kit_start_prove_and_pr_preflight() {
     let tmp = tempfile::tempdir().unwrap();
     let tacho_home = tmp.path().join("tacho-home");

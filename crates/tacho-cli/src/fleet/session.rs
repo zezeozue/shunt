@@ -135,7 +135,11 @@ fn spawn_worker_with_trace(
     )
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    let home = crate::paths::resolve_home();
+    let home = if !store.home().as_os_str().is_empty() {
+        store.home().to_path_buf()
+    } else {
+        crate::paths::resolve_home()
+    };
     let logs_dir = home.join("logs");
     fs::create_dir_all(&logs_dir)?;
     let log_path = logs_dir.join(format!("{}.log", item.key));
@@ -272,8 +276,13 @@ fn spawn_worker_with_trace(
 
     let mut child = command.spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes())?;
-        stdin.write_all(b"\n")?;
+        for bytes in [prompt.as_bytes(), b"\n"] {
+            if let Err(e) = stdin.write_all(bytes) {
+                if e.kind() != io::ErrorKind::BrokenPipe {
+                    return Err(e);
+                }
+            }
+        }
     }
     let pid = child.id();
     let now = now_secs();

@@ -16,6 +16,14 @@ impl tacho_daemon::exec::Launcher for ProcessLauncher {
     ) -> std::io::Result<u32> {
         crate::fleet::session::spawn_daemon_worker(store, item)
     }
+
+    fn spawn_batch(
+        &self,
+        store: &mut tacho_daemon::FleetStore,
+        plan: &tacho_core::decide::verify::BatchPlan,
+    ) -> std::io::Result<u32> {
+        crate::fleet::batch::spawn_daemon_batch(store, plan)
+    }
 }
 
 /// Runs the tachograph flight recorder daemon server.

@@ -43,6 +43,13 @@ pub const RESUME_REFUSED: io::ErrorKind = io::ErrorKind::ResourceBusy;
 pub trait Launcher: Send + Sync {
     /// Starts and records a worker in its allocated worktree.
     fn spawn_worker(&self, store: &mut FleetStore, item: &TodoItem) -> io::Result<u32>;
+
+    /// Starts and records a verification batch run for `plan`.
+    fn spawn_batch(
+        &self,
+        store: &mut FleetStore,
+        plan: &tacho_core::decide::verify::BatchPlan,
+    ) -> io::Result<u32>;
 }
 
 /// What a caller of [`run_tick`] can physically do.
@@ -50,6 +57,16 @@ pub trait Hands {
     /// Starts a worker for a dispatched item and records it (`dispatch/start`).
     /// `Ok(None)`: this process cannot start workers; the item stays queued.
     fn spawn_worker(&mut self, store: &mut FleetStore, item: &TodoItem) -> io::Result<Option<u32>>;
+
+    /// Starts a verification batch for `plan` and records it (`verify/batch_start`).
+    /// `Ok(None)`: this process cannot start batches; the batch stays planned for an executor that can.
+    fn spawn_batch(
+        &mut self,
+        _store: &mut FleetStore,
+        _plan: &tacho_core::decide::verify::BatchPlan,
+    ) -> io::Result<Option<u32>> {
+        Ok(None)
+    }
 
     /// Delivers a decided message to an agent and records the delivery.
     fn deliver_tell(
@@ -644,6 +661,13 @@ fn persist_plan_state(
         st.inbox = next.inbox.clone();
         st.last_tick_ts = next.last_tick_ts;
         st.last_watchdog_alert_ts = next.last_watchdog_alert_ts;
+        st.digest_sent_at = next.digest_sent_at;
+        st.digest_entries = next.digest_entries.clone();
+        if let Some(prs) =
+            observe::env_json::<Vec<tacho_core::decide::dispatch::PullFacts>>("TACHO_OPEN_PRS_JSON")
+        {
+            st.open_prs_cache = prs;
+        }
         if let Some(ci) =
             observe::env_json::<tacho_core::decide::ops::snapshot::MainCiRun>("TACHO_MAIN_CI_JSON")
         {
@@ -1014,6 +1038,27 @@ fn execute_actions(
         }
     }
 
+    // Speculative verification batches.
+    for batch in &plan.batch_plans {
+        match f.hands.spawn_batch(store, batch) {
+            Ok(Some(pid)) => println!(
+                "Started batch {} for PRs {:?} (pid {pid})",
+                batch.id, batch.prs
+            ),
+            Ok(None) => {
+                store.record_decision("verify", "batch_queued", &batch.id, &batch.because)?
+            }
+            Err(e) => f.record(
+                store,
+                "verify",
+                "batch_start_failed",
+                &batch.id,
+                &format!("failed to start batch {}: {e}", batch.id),
+                true,
+            )?,
+        }
+    }
+
     // Janitor.
     if !plan.tidy_decisions.is_empty() {
         tidy::apply_tidy_decisions(store, &plan.tidy_decisions, now, false)?;
@@ -1078,29 +1123,54 @@ fn execute_actions(
             }
         }
         if let Some(forge) = forge {
-            let issue_title = if n.kind == "main_red" || n.kind == "main-red" {
-                "main is red".to_string()
-            } else {
-                format!("tacho alert: {}", n.key)
-            };
-            match forge.set_issue(&issue_title, &n.body) {
-                Ok(issue) => delivered |= issue.is_some(),
-                Err(e) => {
-                    notify_failed = true;
-                    f.record(
-                        store,
-                        "watch",
-                        "set_issue_failed",
-                        &n.key,
-                        &format!("failed to set issue '{issue_title}' for {}: {e}", n.key),
-                        true,
-                    )?;
+            if !matches!(n.kind.as_str(), "ready-train" | "digest") {
+                let issue_title = if n.kind == "main_red" || n.kind == "main-red" {
+                    "main is red".to_string()
+                } else {
+                    format!("tacho alert: {}", n.key)
+                };
+                match forge.set_issue(&issue_title, &n.body) {
+                    Ok(issue) => delivered |= issue.is_some(),
+                    Err(e) => {
+                        notify_failed = true;
+                        f.record(
+                            store,
+                            "watch",
+                            "set_issue_failed",
+                            &n.key,
+                            &format!("failed to set issue '{issue_title}' for {}: {e}", n.key),
+                            true,
+                        )?;
+                    }
                 }
             }
         }
         if notify_failed || !delivered {
+            let prev_digest_sent = state.digest_sent_at;
+            let prev_digest_entries = state.digest_entries.clone();
             store.mutate(None, |st| {
                 st.notified_failures.remove(&n.key);
+                if n.kind == "digest" {
+                    st.digest_sent_at = prev_digest_sent;
+                    for entry in &prev_digest_entries {
+                        if !st.digest_entries.iter().any(|(_, msg)| msg == &entry.1) {
+                            st.digest_entries.push(entry.clone());
+                        }
+                    }
+                    for other in &plan.owner_notifications {
+                        if other.kind != "digest"
+                            && st.notified_failures.contains(&other.key)
+                            && !st
+                                .digest_entries
+                                .iter()
+                                .any(|(_, msg)| msg == &other.because)
+                        {
+                            st.digest_entries.push((now, other.because.clone()));
+                        }
+                    }
+                } else if !prev_digest_entries.iter().any(|(_, msg)| msg == &n.because) {
+                    st.digest_entries.retain(|(_, msg)| msg != &n.because);
+                }
             })?;
         } else {
             store.record_decision("watch", "notify_owner", &n.key, &n.because)?;

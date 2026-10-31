@@ -228,6 +228,15 @@ pub struct FleetMeta {
 }
 
 pub fn record_batch_pid_identity(batch_id: &str, pid: u32) -> io::Result<BatchPidIdentity> {
+    let home = crate::paths::resolve_home();
+    record_batch_pid_identity_in(&home, batch_id, pid)
+}
+
+pub fn record_batch_pid_identity_in(
+    home: &Path,
+    batch_id: &str,
+    pid: u32,
+) -> io::Result<BatchPidIdentity> {
     let identity = BatchPidIdentity {
         pid,
         starttime: proc_pid_starttime(pid),
@@ -235,7 +244,7 @@ pub fn record_batch_pid_identity(batch_id: &str, pid: u32) -> io::Result<BatchPi
     };
     let id_clone = identity.clone();
     let batch_key = batch_id.to_string();
-    mutate_fleet_meta(move |m| {
+    mutate_fleet_meta_in(home, move |m| {
         m.batch_identities.insert(batch_key, id_clone);
     })?;
     Ok(identity)
@@ -248,7 +257,13 @@ pub fn fleet_meta_path() -> io::Result<PathBuf> {
 }
 
 pub fn load_fleet_meta() -> io::Result<FleetMeta> {
-    let path = fleet_meta_path()?;
+    let home = crate::paths::resolve_home();
+    load_fleet_meta_in(&home)
+}
+
+pub fn load_fleet_meta_in(home: &Path) -> io::Result<FleetMeta> {
+    crate::paths::ensure_dir_0700(home)?;
+    let path = home.join("fleet_meta.json");
     if !path.is_file() {
         return Ok(FleetMeta::default());
     }
@@ -257,7 +272,13 @@ pub fn load_fleet_meta() -> io::Result<FleetMeta> {
 }
 
 pub fn save_fleet_meta(meta: &FleetMeta) -> io::Result<()> {
-    let path = fleet_meta_path()?;
+    let home = crate::paths::resolve_home();
+    save_fleet_meta_in(&home, meta)
+}
+
+pub fn save_fleet_meta_in(home: &Path, meta: &FleetMeta) -> io::Result<()> {
+    crate::paths::ensure_dir_0700(home)?;
+    let path = home.join("fleet_meta.json");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -269,9 +290,16 @@ pub fn mutate_fleet_meta<F, R>(f: F) -> io::Result<R>
 where
     F: FnOnce(&mut FleetMeta) -> R,
 {
-    use std::os::unix::io::AsRawFd;
     let home = crate::paths::resolve_home();
-    crate::paths::ensure_dir_0700(&home)?;
+    mutate_fleet_meta_in(&home, f)
+}
+
+pub fn mutate_fleet_meta_in<F, R>(home: &Path, f: F) -> io::Result<R>
+where
+    F: FnOnce(&mut FleetMeta) -> R,
+{
+    use std::os::unix::io::AsRawFd;
+    crate::paths::ensure_dir_0700(home)?;
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -291,9 +319,9 @@ where
         }
     }
     let _guard = UnlockGuard(lock_file);
-    let mut meta = load_fleet_meta().unwrap_or_default();
+    let mut meta = load_fleet_meta_in(home).unwrap_or_default();
     let out = f(&mut meta);
-    save_fleet_meta(&meta)?;
+    save_fleet_meta_in(home, &meta)?;
     Ok(out)
 }
 

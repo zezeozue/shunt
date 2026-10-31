@@ -74,6 +74,10 @@ pub struct DecisionState {
     pub tidy_min_age_secs: i64,
     #[serde(default)]
     pub inbox: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub digest_sent_at: Option<i64>,
+    #[serde(default)]
+    pub digest_entries: Vec<(i64, String)>,
 }
 
 /// Observation of a finished batch check on the current tick.
@@ -552,13 +556,32 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
         &next.area_rules,
         MAX_BATCH_SIZE,
     );
+    let mut merged_since_map: HashMap<String, Vec<u64>> = HashMap::new();
+    if !next.merged_prs.is_empty() {
+        for rec in next.passed.values() {
+            if !rec.main_sha.is_empty() && rec.main_sha != obs.main_sha {
+                let Some(b) = next.batches.iter().find(|b| b.id == rec.batch_id) else {
+                    continue;
+                };
+                let merged_in_batch: Vec<u64> = b
+                    .prs
+                    .iter()
+                    .copied()
+                    .filter(|pr| next.merged_prs.contains(pr))
+                    .collect();
+                if !merged_in_batch.is_empty() {
+                    merged_since_map.insert(rec.main_sha.clone(), merged_in_batch);
+                }
+            }
+        }
+    }
     let ready_prs = queue(
         &obs.open_prs,
         &next.passed,
         &next.batches,
         &next.holds,
         &obs.main_sha,
-        &HashMap::new(),
+        &merged_since_map,
         &next.area_rules,
     );
     let tidy_min_age = if next.tidy_min_age_secs > 0 {
@@ -697,17 +720,29 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
     let verified_trains: Vec<_> = obs
         .ready_trains
         .iter()
-        .filter(|(_, order, heads)| {
-            !order.is_empty()
-                && order.iter().all(|pr| {
+        .filter_map(|(train_id, order, heads)| {
+            let remaining: Vec<u64> = order
+                .iter()
+                .copied()
+                .filter(|pr| !next.merged_prs.contains(pr) && !next.closed_prs.contains(pr))
+                .collect();
+            if remaining.is_empty()
+                || !remaining.iter().all(|pr| {
                     ready_prs
                         .iter()
                         .any(|item| item.pr == *pr && heads.get(pr) == Some(&item.sha))
                 })
+            {
+                return None;
+            }
+            let remaining_heads: BTreeMap<u64, String> = remaining
+                .iter()
+                .filter_map(|pr| heads.get(pr).map(|sha| (*pr, sha.clone())))
+                .collect();
+            Some((train_id.clone(), remaining, remaining_heads))
         })
-        .cloned()
         .collect();
-    let owner_notifications = decide_owner_notifications(
+    let mut owner_notifications = decide_owner_notifications(
         &attention_items,
         &next.batches,
         &verified_trains,
@@ -717,6 +752,110 @@ pub fn decide(state: &DecisionState, obs: &WorldObservation) -> DecisionPlan {
     );
     for n in &owner_notifications {
         next.notified_keys.insert(n.key.clone());
+    }
+
+    for (k, found_pr, is_none) in &reaped_agents {
+        let line = if let Some(pr) = found_pr {
+            Some(format!("{k} opened PR #{pr}"))
+        } else if *is_none {
+            Some(format!("{k} finished with PR: none"))
+        } else {
+            None
+        };
+        if let Some(line) = line {
+            if !next.digest_entries.iter().any(|(_, msg)| msg == &line) {
+                next.digest_entries.push((obs.now, line));
+            }
+        }
+    }
+    for res in &batch_resolutions {
+        let line = match res {
+            BatchResolution::Passed { batch_id, prs } => {
+                Some(format!("batch {batch_id} passed PRs {prs:?}"))
+            }
+            BatchResolution::FailedSingle {
+                batch_id,
+                pr,
+                reason,
+            } => Some(format!("batch {batch_id} failed PR #{pr}: {reason}")),
+            BatchResolution::Bisect {
+                batch_id,
+                left_prs,
+                right_prs,
+            } => Some(format!(
+                "batch {batch_id} bisecting {left_prs:?} vs {right_prs:?}"
+            )),
+            BatchResolution::InfraRetry { batch_id, reason } => Some(format!(
+                "batch {batch_id} retrying after infra flake: {reason}"
+            )),
+            BatchResolution::HeadMoved { .. } => None,
+        };
+        if let Some(line) = line {
+            if !next.digest_entries.iter().any(|(_, msg)| msg == &line) {
+                next.digest_entries.push((obs.now, line));
+            }
+        }
+    }
+    for n in &owner_notifications {
+        if n.kind != "digest" && !next.digest_entries.iter().any(|(_, msg)| msg == &n.because) {
+            next.digest_entries.push((obs.now, n.because.clone()));
+        }
+    }
+
+    let stuck_lines: Vec<String> = attention_items
+        .iter()
+        .filter(|a| a.kind == "stuck")
+        .map(|a| a.summary.clone())
+        .collect();
+    match next.digest_sent_at {
+        None => {
+            if obs.now > 0 {
+                next.digest_sent_at = Some(obs.now);
+            }
+        }
+        Some(last_sent) => {
+            if obs.now.saturating_sub(last_sent) >= 86_400
+                && (!next.digest_entries.is_empty() || !stuck_lines.is_empty())
+            {
+                let mut sections = Vec::new();
+                if !next.digest_entries.is_empty() {
+                    let events_text: Vec<String> = next
+                        .digest_entries
+                        .iter()
+                        .map(|(ts, msg)| format!("{ts}  {msg}"))
+                        .collect();
+                    sections.push(format!("EVENTS\n{}", events_text.join("\n")));
+                }
+                if !stuck_lines.is_empty() {
+                    sections.push(format!("STUCK\n{}", stuck_lines.join("\n")));
+                }
+                sections.push(format!(
+                    "PROGRESS\nagents={} todo={} ready={}",
+                    next.agents.len(),
+                    next.todo.len(),
+                    ready_prs.len()
+                ));
+                let scrubber = crate::scrub::Scrubber::enabled();
+                let key = format!("digest:{}", obs.now);
+                let because = scrubber.scrub(&format!(
+                    "daily digest is due ({} event(s), {} stuck)",
+                    next.digest_entries.len(),
+                    stuck_lines.len()
+                ));
+                let body = scrubber.scrub(&sections.join("\n\n"));
+                next.notified_keys.insert(key.clone());
+                next.digest_sent_at = Some(obs.now);
+                next.digest_entries.clear();
+                owner_notifications.push(OwnerNotification {
+                    key,
+                    kind: "digest".to_string(),
+                    subject: "[tacho] daily digest".to_string(),
+                    body,
+                    command_hint: "tacho status".to_string(),
+                    because,
+                });
+            }
+        }
     }
 
     let has_active_work = !obs.live_keys.is_empty() || !next.todo.is_empty();

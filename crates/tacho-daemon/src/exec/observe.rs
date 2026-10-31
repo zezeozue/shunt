@@ -739,6 +739,8 @@ pub fn decision_state_of(state: &FleetState, now: i64) -> DecisionState {
         inbox: state.inbox.clone(),
         last_watchdog_alert_ts: state.last_watchdog_alert_ts,
         tidy_min_age_secs: 3_600,
+        digest_sent_at: state.digest_sent_at,
+        digest_entries: state.digest_entries.clone(),
     }
 }
 
@@ -821,20 +823,35 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
     let agent_samples = agent_samples(state, host, &live_keys);
     let repo_obs = host.repo.map(observe_repo).unwrap_or_default();
 
+    let open_prs = env_json::<Vec<tacho_core::decide::dispatch::PullFacts>>("TACHO_OPEN_PRS_JSON")
+        .unwrap_or_else(|| state.open_prs_cache.clone());
+
     let mut ready_trains = Vec::new();
     if let Some(open) = tacho_core::decide::land::open_for(&state.trains) {
-        let heads = open
+        let active_prs: Vec<u64> = open
             .prs
             .iter()
+            .copied()
+            .filter(|pr| {
+                !open.landed_prs.contains(pr)
+                    && !state.merged_prs.contains(pr)
+                    && !state.closed_prs.contains(pr)
+            })
+            .collect();
+        let heads = active_prs
+            .iter()
             .filter_map(|&pr| {
-                state
-                    .open_prs_cache
+                open_prs
                     .iter()
                     .find(|p| p.number == pr)
                     .map(|p| (pr, p.head.clone()))
+                    .or_else(|| open.shas.get(&pr).map(|sha| (pr, sha.clone())))
+                    .or_else(|| state.passed.get(&pr).map(|rec| (pr, rec.sha.clone())))
             })
             .collect();
-        ready_trains.push((open.id.clone(), open.prs.clone(), heads));
+        if !active_prs.is_empty() {
+            ready_trains.push((open.id.clone(), active_prs, heads));
+        }
     }
 
     let agent_roots: BTreeSet<u32> = live_keys
@@ -924,7 +941,7 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
     let world = WorldObservation {
         now,
         main_sha: host.main_sha.clone(),
-        open_prs: state.open_prs_cache.clone(),
+        open_prs,
         merged_prs: state.merged_prs.clone(),
         closed_prs: state.closed_prs.clone(),
         tidy_snapshot,
@@ -945,10 +962,21 @@ pub fn observe(state: &FleetState, host: &HostObs<'_>) -> (DecisionState, WorldO
     (decision_state_of(state, now), world)
 }
 
-/// Explicit offline / test override of a forge observation, read from `var` as JSON.
+/// Explicit offline / test override of a forge observation, read from `var` as JSON (or `@<path>`).
 pub fn env_json<T: serde::de::DeserializeOwned>(var: &str) -> Option<T> {
     let raw = std::env::var(var).ok()?;
-    match serde_json::from_str(&raw) {
+    let payload = if let Some(path) = raw.strip_prefix('@') {
+        match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[tacho] ignoring unreadable {var} ({path}): {e}");
+                return None;
+            }
+        }
+    } else {
+        raw
+    };
+    match serde_json::from_str(&payload) {
         Ok(v) => Some(v),
         Err(e) => {
             eprintln!("[tacho] ignoring invalid {var}: {e}");
